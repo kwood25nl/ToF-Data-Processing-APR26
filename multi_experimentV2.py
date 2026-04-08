@@ -13,6 +13,8 @@ ALWAYS_VALID_COLOR = "#52A83C"
 MOST_VALID_COLOR   = "#F6C6A7"
 LEAST_VALID_COLOR  = "#E97122"
 NO_DATA_COLOR      = "#D9D9D9"
+PALETTE = ["#E8708E", "#EDD020", "#E97122", "#52A83C",
+           "#18A5AA", "#55A9D4", "#2E61A8"]
 
 # Validity plot colors (match Visualize.py)
 VALID_COLOR     = "#52A83C"
@@ -1139,31 +1141,291 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
     plt.savefig(save_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
 
+def comparative_valid_raw_boxplots(experiments: dict, output_path: str):
+    """
+    Grouped boxplots of RAW VALID measured distances per distance.
+    Each experiment is its own color (PALETTE).
+    Data: pool all zones' distance_mm values where is_valid_range == 1.
+    """
+    all_dist_keys = set()
+    for name, (trimmed, _, _) in experiments.items():
+        all_dist_keys.update(trimmed.keys())
+
+    exp_names = list(experiments.keys())
+    n_exps = len(exp_names)
+
+    dist_keys = sorted(all_dist_keys, key=lambda k: extract_true_distance(k))
+    if not dist_keys or n_exps == 0:
+        return
+
+    x_positions = np.arange(len(dist_keys))
+    width = 0.8 / max(n_exps, 1)
+
+    fig, ax = plt.subplots(figsize=(max(12, 2.0 * len(dist_keys)), 7))
+    ax.set_title("Raw Valid Distance Readings per Experiment (Grouped Boxplots)", fontsize=12)
+
+    for i, name in enumerate(exp_names):
+        trimmed, _, _ = experiments[name]
+        color = PALETTE[i % len(PALETTE)]
+
+        for j, dist_key in enumerate(dist_keys):
+            if dist_key not in trimmed:
+                continue
+
+            zone_data = trimmed[dist_key]
+
+            # pool valid-only measurements across zones (no analyse_tof_data needed)
+            chunks = []
+            for z in range(64):
+                arr = zone_data.get("distance_mm", {}).get(z)
+                v = zone_data.get("is_valid_range", {}).get(z)
+                if arr is None or v is None:
+                    continue
+
+                arr = np.asarray(arr)
+                v = np.asarray(v)
+
+                mask01 = (v == 0) | (v == 1)
+                if not np.any(mask01):
+                    continue
+                v01 = v[mask01]
+                arr01 = arr[:len(v)][mask01]
+
+                mask_valid = (v01 == 1)
+                if np.any(mask_valid):
+                    chunks.append(arr01[mask_valid])
+
+            all_valid = _safe_concat(chunks)
+            if all_valid is None or len(all_valid) == 0:
+                continue
+
+            pos = x_positions[j] + (i - n_exps / 2 + 0.5) * width
+
+            ax.boxplot(all_valid,
+                       positions=[pos],
+                       widths=width * 0.9,
+                       patch_artist=True,
+                       manage_ticks=False,
+                       medianprops=dict(color="white", linewidth=1.3),
+                       whiskerprops=dict(color=color, linewidth=1.0),
+                       capprops=dict(color=color, linewidth=1.0),
+                       flierprops=dict(marker=".", markersize=2,
+                                       markerfacecolor=color, alpha=0.35),
+                       boxprops=dict(facecolor=color, color=color,
+                                     linewidth=1.0))
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(dist_keys, fontsize=9)
+    ax.set_xlabel("Distance", fontsize=10)
+    ax.set_ylabel("Measured distance [mm] (valid only)", fontsize=10)
+
+    ax.yaxis.set_minor_locator(plt.MultipleLocator(0.2))
+    ax.grid(True, which="major", color="grey", linewidth=0.5, alpha=0.25, zorder=0)
+    ax.grid(True, which="minor", color="grey", linewidth=0.3, alpha=0.15, zorder=0)
+
+    legend_elements = [
+        mpatches.Patch(facecolor=PALETTE[i % len(PALETTE)], label=name)
+        for i, name in enumerate(exp_names)
+    ]
+    ax.legend(handles=legend_elements, fontsize=8, loc="upper left", framealpha=0.95)
+
+    plt.tight_layout()
+    save_path = os.path.join(output_path, "Comparative_Valid_Raw_Boxplots_MultiExperiment.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+
+def ridgeplot_valid_raw_all_experiments(experiments: dict, output_path: str):
+    """
+    Ridge/KDE plot like Visualize.plot_ridge_by_distance, but:
+      - Pools ALL VALID raw distance readings across ALL experiments per distance.
+      - Uses measured distance values (mm), not error.
+      - Draws dashed vertical lines at each true distance (target).
+
+    Output:
+      MultiExperiment_Ridgeplot_ValidRaw_MultiExperiment.png
+    """
+    import pandas as pd
+    import seaborn as sns
+
+    sns.set_theme(style="white", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+    # Collect all distances
+    all_dist_keys = set()
+    for _name, (trimmed, _n_frames, _shortest) in experiments.items():
+        all_dist_keys.update(trimmed.keys())
+
+    dist_keys = sorted(all_dist_keys, key=lambda k: extract_true_distance(k))
+    if not dist_keys:
+        return
+
+    per_dist = []
+    for dist_key in dist_keys:
+        true_distance = extract_true_distance(dist_key)
+
+        pooled_chunks = []
+
+        for _exp_name, (trimmed, _n_frames, _shortest) in experiments.items():
+            if dist_key not in trimmed:
+                continue
+
+            zone_data = trimmed[dist_key]
+
+            # pool valid-only measurements across zones for this experiment
+            for z in range(64):
+                arr = zone_data.get("distance_mm", {}).get(z)
+                v = zone_data.get("is_valid_range", {}).get(z)
+                if arr is None or v is None:
+                    continue
+
+                arr = np.asarray(arr)
+                v = np.asarray(v)
+
+                # robustness: only 0/1 validity entries are considered; others treated as invalid
+                mask01 = (v == 0) | (v == 1)
+                if not np.any(mask01):
+                    continue
+
+                v01 = v[mask01]
+                arr01 = arr[:len(v)][mask01]
+
+                mask_valid = (v01 == 1)
+                if np.any(mask_valid):
+                    pooled_chunks.append(arr01[mask_valid])
+
+        meas = _safe_concat(pooled_chunks)
+        if meas is None or len(meas) == 0:
+            continue
+
+        per_dist.append((dist_key, true_distance, meas))
+
+    if not per_dist:
+        return
+
+    # Build long dataframe
+    rows = []
+    for dist_key, true_distance, meas in per_dist:
+        for x in meas:
+            rows.append({"dist_key": dist_key, "true_distance": true_distance, "x": float(x)})
+
+    df = pd.DataFrame(rows)
+
+    order = [k for (k, _, _) in per_dist]
+    df["dist_key"] = pd.Categorical(df["dist_key"], categories=order, ordered=True)
+
+    palette = sns.cubehelix_palette(len(order), rot=-.25, light=.7)
+
+    g = sns.FacetGrid(
+        df,
+        row="dist_key",
+        hue="dist_key",
+        aspect=22,
+        height=0.42,
+        palette=palette
+    )
+
+    g.map(
+        sns.kdeplot,
+        "x",
+        bw_adjust=0.8,
+        clip_on=False,
+        fill=False,
+        alpha=1,
+        linewidth=1.3
+    )
+    g.map(
+        sns.kdeplot,
+        "x",
+        bw_adjust=0.8,
+        clip_on=False,
+        fill=True,
+        alpha=.7,
+        linewidth=0
+    )
+    g.map(plt.axhline, y=0, lw=0.8, clip_on=False)
+
+    true_dists = [td for _, td, _ in per_dist]
+    xticks = sorted(true_dists)
+
+    axes = g.axes.flatten()
+    for idx, ax in enumerate(axes):
+        for td in true_dists:
+            ax.axvline(td, color="grey", linestyle="--",
+                       linewidth=0.8, alpha=0.7, zorder=0)
+
+        ax.set_xticks(xticks)
+        ax.grid(True, axis="x", color="grey", linewidth=0.4, alpha=0.2)
+
+        # Only bottom facet shows x tick labels
+        if idx != len(axes) - 1:
+            ax.tick_params(axis="x", labelbottom=False)
+        else:
+            ax.tick_params(axis="x", labelrotation=45)
+
+    def label(x, color, label):
+        ax = plt.gca()
+        ax.text(
+            0.01, 0.2, label,
+            fontweight="bold", color=color,
+            ha="left", va="center",
+            transform=ax.transAxes,
+            fontsize=7.5
+        )
+
+    g.map(label, "x")
+
+    g.fig.subplots_adjust(
+        hspace=-0.55,
+        left=0.06,
+        right=0.995,
+        top=0.92,
+        bottom=0.13
+    )
+
+    g.set_titles("")
+    g.set(yticks=[], ylabel="")
+    g.despine(bottom=True, left=True)
+    g.set_xlabels("Distance [mm] (valid only, all experiments pooled)")
+
+    g.fig.suptitle(
+        "Distance Ridge Plot (valid-only, all experiments pooled)\n",
+        fontsize=12
+    )
+
+    save_path = os.path.join(output_path, "MultiExperiment_Ridgeplot_ValidRaw_MultiExperiment.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=300)
+    plt.close(g.fig)
+
 # ── Master entrypoint ─────────────────────────────────────────────────────────
 def generate_multi_experiment_plots_v2(experiment_folders: dict, origin: int, output_path: str) -> str:
     experiments = load_multi_experiment(experiment_folders, origin)
     plots_folder = setup_output_folder(output_path, "multiV2")
 
-    # print("Generating concatenated overall validity heatmap...")
-    # plot_multiexp_validity_heatmap(experiments, plots_folder)
-    #
-    # print("Generating error and validity plot...")
-    # plot_multiexp_error_and_validity(experiments, plots_folder)
-    #
-    # print("Generating multi-experiment error heatmaps...")
-    # plot_multiexp_error_heatmaps(experiments, plots_folder)
-    #
-    # print("Generating per-distance heatmaps (multi-experiment, valid-only)...")
-    # plot_multiexp_per_distance_heatmaps(experiments, plots_folder)
-    #
-    # print("Generating per-distance tiled boxplots (multi-experiment, includes invalid measurements)...")
-    # plot_multiexp_tiled_boxplots(experiments, plots_folder)
-    #
-    # print("Generating per-distance tiled validity plots (multi-experiment)...")
-    # plot_multiexp_tiled_validity(experiments, plots_folder)
+    print("Generating concatenated overall validity heatmap...")
+    plot_multiexp_validity_heatmap(experiments, plots_folder)
+
+    print("Generating error and validity plot...")
+    plot_multiexp_error_and_validity(experiments, plots_folder)
+
+    print("Generating multi-experiment error heatmaps...")
+    plot_multiexp_error_heatmaps(experiments, plots_folder)
+
+    print("Generating per-distance heatmaps (multi-experiment, valid-only)...")
+    plot_multiexp_per_distance_heatmaps(experiments, plots_folder)
+
+    print("Generating per-distance tiled boxplots (multi-experiment, includes invalid measurements)...")
+    plot_multiexp_tiled_boxplots(experiments, plots_folder)
+
+    print("Generating per-distance tiled validity plots (multi-experiment)...")
+    plot_multiexp_tiled_validity(experiments, plots_folder)
 
     print("Generating drift envelope plot...")
     plot_multiexp_drift_envelope(experiments, plots_folder)
+
+    print("Generating grouped raw-valid boxplots...")
+    comparative_valid_raw_boxplots(experiments, plots_folder)
+
+    print("Generating pooled valid-only ridge plot...")
+    ridgeplot_valid_raw_all_experiments(experiments, plots_folder)
 
     print("Done!")
     return plots_folder
