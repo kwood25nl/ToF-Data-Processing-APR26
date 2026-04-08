@@ -28,8 +28,16 @@ def setup_output_folder(output_path: str) -> str:
 
 def zone_to_grid(z: int):
     """
-    Zone 0 = bottom-left, zone 63 = top-right.
-    Flips row so that zone 0 appears at the bottom of the matplotlib grid.
+    Returns (row, col) for use with a matplotlib subplot array (axes[row][col]).
+
+    In subplot arrays row 0 is the TOP row, so we flip the physical row index
+    so that Z0 (physical row 0) lands in the BOTTOM subplot row and Z63
+    (physical row 7) lands in the TOP subplot row — giving Z0 bottom-left and
+    Z63 top-right in the tiled subplot layout.
+
+    NOTE: This is for subplot-grid positioning only.  Patch-based heatmaps use
+    the raw zone coordinates (z // 8, z % 8) without any flip, because in
+    matplotlib's data-coordinate system y=0 is already at the bottom.
     """
     physical_row = z // 8
     col          = z % 8
@@ -40,6 +48,30 @@ def zone_to_grid(z: int):
 def extract_true_distance(key: str) -> float:
     digits = re.findall(r"-?\d+", key)
     return float("".join(digits))
+
+
+def _assert_heatmap_orientation():
+    """
+    Debug self-check: asserts that the patch-based heatmap placement logic
+    puts Z0 at bottom-left and Z63 at top-right.
+
+    For an 8x8 grid with zone labels in zone-index order (Z0 first):
+      i=0  → r = 0//8 = 0, c = 0%8 = 0  → patch at (c=0, r=0) = bottom-left  ✓
+      i=63 → r = 63//8 = 7, c = 63%8 = 7 → patch at (c=7, r=7) = top-right    ✓
+
+    (In matplotlib data coordinates y=0 is bottom, so r=0 is the bottom row.)
+    """
+    rows, cols = 8, 8
+    for z in range(64):
+        r = z // cols
+        c = z % cols
+        assert r == z // 8, f"Row mismatch for Z{z}"
+        assert c == z % 8,  f"Col mismatch for Z{z}"
+
+    r0, c0   = 0 // 8, 0 % 8
+    r63, c63 = 63 // 8, 63 % 8
+    assert r0  == 0 and c0  == 0, "Z0  is not at bottom-left (r=0, c=0)"
+    assert r63 == 7 and c63 == 7, "Z63 is not at top-right  (r=7, c=7)"
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
@@ -106,8 +138,9 @@ def draw_heatmap(ax, means: dict, true_distance: float,
         means:         Dict of group_index -> mean value.
         true_distance: Target distance for colour coding.
         grid_shape:    (rows, cols) of the grid.
-        zone_labels:   List of label strings per cell (row-major, top-to-bottom).
-        cell_means:    List of mean values per cell (row-major, top-to-bottom).
+        zone_labels:   List of label strings per cell in zone-index order
+                       (Z0 first = bottom-left, Z63 last = top-right).
+        cell_means:    List of mean values per cell, same order as zone_labels.
     """
     rows, cols = grid_shape
     all_vals   = [v for v in means.values() if v is not None]
@@ -117,7 +150,9 @@ def draw_heatmap(ax, means: dict, true_distance: float,
     for i, (label, mean_val) in enumerate(zip(zone_labels, cell_means)):
         r = i // cols
         c = i % cols
-        r = (rows - 1) - r  # flip for matplotlib
+        # No row flip: in matplotlib data coordinates y=0 is bottom,
+        # so i=0 (Z0) lands at (c=0, r=0) = bottom-left, and
+        # i=63 (Z63) lands at (c=7, r=7) = top-right.
 
         if mean_val is not None:
             color = colour_for_value(mean_val, true_distance, min_val, max_val)
@@ -499,7 +534,7 @@ def plot_tiled_heatmaps(data: dict, stats_data: dict, output_path: str):
         for i, (label, err) in enumerate(zip(cell_labels, cell_errors)):
             r = i // cols
             c = i % cols
-            r = (rows - 1) - r  # flip for matplotlib
+            # No row flip: y=0 is bottom in matplotlib data coordinates.
 
             if err is None:
                 color = (0.85, 0.85, 0.85, 1.0)
@@ -616,7 +651,7 @@ def plot_tiled_heatmaps(data: dict, stats_data: dict, output_path: str):
             r = z // 8
             c = z % 8
             ring = get_ring(z)
-            plot_r = 7 - r
+            plot_r = r
 
             err = ring_err.get(ring)
             if err is None:
@@ -750,7 +785,7 @@ def draw_error_heatmap(ax, abs_errors: dict, bias_errors: dict,
             zip(zone_labels, cell_abs, cell_bias)):
         r = i // cols
         c = i % cols
-        r = (rows - 1) - r  # flip for matplotlib
+        # No row flip: y=0 is bottom in matplotlib data coordinates.
 
         if bias_val is not None:
             color = bias_colour(bias_val, min_bias, max_bias)
@@ -892,7 +927,7 @@ def plot_error_heatmaps(data: dict, stats_data: dict, output_path: str):
         c        = z % 8
         ring     = get_ring(z)
         bias_val = ring_bias_means.get(ring)
-        plot_r   = 7 - r
+        plot_r   = r
 
         color = bias_colour(bias_val, min_bias, max_bias) \
                 if bias_val is not None else (0.85, 0.85, 0.85, 1.0)
@@ -905,7 +940,7 @@ def plot_error_heatmaps(data: dict, stats_data: dict, output_path: str):
         ax.add_patch(rect)
 
         # --- Only label each ring once (top-left cell of that ring) ---
-        # Ring r's outer offset is r, so top-left plot cell is (c=r, plot_r=7-r).
+        # With plot_r = r, the top-left cell of ring k is at (c=k, plot_r=7-k).
         label_once = (c == ring) and (plot_r == (7 - ring))
         if label_once:
             abs_val   = ring_abs_means.get(ring)
@@ -979,7 +1014,7 @@ def plot_overall_validity_heatmap(data: dict, stats_data: dict, output_path: str
     for z in range(64):
         r      = z // 8
         c      = z % 8
-        plot_r = 7 - r
+        plot_r = r
         pct    = zone_mean_validity.get(z)
 
         if pct is None or pct >= 100.0:
