@@ -53,6 +53,16 @@ def load_multi_experiment(experiment_folders: dict, origin: int) -> dict:
         print(f"  {name}: {n_frames} frames, shortest dataset: {shortest}")
         experiments[name] = (trimmed, n_frames, shortest)
     return experiments
+import re  # add at top if not already present
+
+def extract_true_distance(key: str) -> float:
+    digits = re.findall(r"-?\d+", key)
+    return float("".join(digits))
+
+
+def _safe_concat(arr_list):
+    arr_list = [a for a in arr_list if a is not None and len(a) > 0]
+    return np.concatenate(arr_list) if arr_list else None
 
 def compute_zone_validity_percent_concat(experiments: dict) -> dict:
     """
@@ -363,6 +373,252 @@ def plot_multiexp_error_and_validity(experiments: dict, output_path: str):
     plt.savefig(save_path, bbox_inches="tight", dpi=300)
     plt.close(fig)
 
+def compute_multiexp_zone_errors_concat(experiments: dict) -> tuple[dict, dict]:
+    """
+    Pools valid-only signed error samples per zone across ALL experiments and ALL distances.
+
+    signed_error_sample = distance_mm - true_distance
+    Only include samples where is_valid_range == 1.
+
+    Returns:
+        abs_errors:  zone -> mean absolute error
+        bias_errors: zone -> mean bias (signed) error
+    """
+    zone_signed = {z: [] for z in range(64)}
+
+    for _exp_name, (trimmed, _n_frames, _shortest) in experiments.items():
+        for dist_key, zone_data in trimmed.items():
+            true_distance = extract_true_distance(dist_key)
+
+            for z in range(64):
+                arr = zone_data.get("distance_mm", {}).get(z)
+                v   = zone_data.get("is_valid_range", {}).get(z)
+                if arr is None or v is None:
+                    continue
+
+                arr = np.asarray(arr)
+                v   = np.asarray(v)
+
+                # use only 0/1 entries (robust)
+                mask01 = (v == 0) | (v == 1)
+                if not np.any(mask01):
+                    continue
+
+                v01   = v[mask01]
+                arr01 = arr[:len(v)][mask01]  # align
+
+                mask_valid = (v01 == 1)
+                if not np.any(mask_valid):
+                    continue
+
+                signed_err = arr01[mask_valid] - true_distance
+                zone_signed[z].append(signed_err)
+
+    abs_errors = {}
+    bias_errors = {}
+    for z in range(64):
+        pooled = _safe_concat(zone_signed[z])
+        if pooled is None or len(pooled) == 0:
+            abs_errors[z] = None
+            bias_errors[z] = None
+        else:
+            bias_errors[z] = float(np.mean(pooled))
+            abs_errors[z]  = float(np.mean(np.abs(pooled)))
+
+    return abs_errors, bias_errors
+
+
+def _bias_colour(bias: float, min_bias: float, max_bias: float) -> tuple:
+    """
+    Same idea as Visualize.bias_colour:
+      positive -> blue, negative -> pink, near 0 -> green.
+    """
+    extreme   = max(abs(min_bias), abs(max_bias))
+    threshold = extreme * 0.2
+
+    if abs(bias) <= threshold:
+        base  = mcolors.to_rgb("#52A83C")
+        alpha = 1.0 - 0.5 * (abs(bias) / (threshold + 1e-9))
+    elif bias > threshold:
+        base  = mcolors.to_rgb("#2E61A8")
+        alpha = 0.5 + 0.5 * (bias / (max_bias + 1e-9))
+    else:
+        base  = mcolors.to_rgb("#E8708E")
+        alpha = 0.5 + 0.5 * (abs(bias) / (abs(min_bias) + 1e-9))
+
+    return (*base, float(np.clip(alpha, 0.5, 1.0)))
+
+
+def _draw_error_heatmap(ax, abs_errors: dict, bias_errors: dict,
+                        grid_shape: tuple, labels: list,
+                        cell_abs: list, cell_bias: list):
+    """
+    Cell colour = bias, cell text = abs error (+ bias).
+    Orientation: NO flip, so Z0 bottom-left and Z63 top-right.
+    """
+    rows, cols = grid_shape
+
+    valid_bias = [v for v in cell_bias if v is not None]
+    min_bias   = min(valid_bias) if valid_bias else 0.0
+    max_bias   = max(valid_bias) if valid_bias else 0.0
+
+    for i, (label, abs_val, bias_val) in enumerate(zip(labels, cell_abs, cell_bias)):
+        r = i // cols
+        c = i % cols
+
+        if bias_val is not None:
+            color = _bias_colour(bias_val, min_bias, max_bias)
+        else:
+            color = (0.85, 0.85, 0.85, 1.0)
+
+        rect = mpatches.FancyBboxPatch(
+            (c, r), 1, 1,
+            boxstyle="square,pad=0",
+            facecolor=color, edgecolor="white", linewidth=0.5,
+            transform=ax.transData
+        )
+        ax.add_patch(rect)
+
+        abs_text  = f"{abs_val:.1f}" if abs_val is not None else "N/A"
+        bias_text = f"b:{bias_val:+.1f}" if bias_val is not None else ""
+        ax.text(c + 0.5, r + 0.5, f"{label}\n{abs_text}\n{bias_text}",
+                ha="center", va="center", fontsize=5.5,
+                color="white", fontweight="bold")
+
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, rows)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+
+
+def plot_multiexp_error_heatmaps(experiments: dict, output_path: str):
+    """
+    Multi-experiment error heatmaps (pooled valid-only errors across all experiments and distances).
+    Z0 bottom-left and Z63 top-right (no flip).
+    """
+    from matplotlib.patches import Patch
+
+    def get_ring(z):
+        r = z // 8
+        c = z % 8
+        return min(r, 7 - r, c, 7 - c)
+
+    abs_errors, bias_errors = compute_multiexp_zone_errors_concat(experiments)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+    fig.suptitle("Multi-Experiment Error Heatmaps\n(text = mean absolute error, colour = bias)",
+                 fontsize=14, y=1.002)
+
+    # 8x8
+    ax = axes[0][0]
+    ax.set_title("8×8 Zone Errors", fontsize=10)
+    labels    = [f"Z{z}" for z in range(64)]
+    cell_abs  = [abs_errors.get(z) for z in range(64)]
+    cell_bias = [bias_errors.get(z) for z in range(64)]
+    _draw_error_heatmap(ax, abs_errors, bias_errors, (8, 8), labels, cell_abs, cell_bias)
+
+    # 4x4
+    ax = axes[0][1]
+    ax.set_title("4×4 Group Errors", fontsize=10)
+    ga, gb, lb, ca, cb = {}, {}, [], [], []
+    for sg in range(16):
+        sr, sc = sg // 4, sg % 4
+        abs_vals, bias_vals = [], []
+        for dr in range(2):
+            for dc in range(2):
+                z = (sr*2 + dr)*8 + (sc*2 + dc)
+                if abs_errors.get(z) is not None:
+                    abs_vals.append(abs_errors[z])
+                if bias_errors.get(z) is not None:
+                    bias_vals.append(bias_errors[z])
+        ga[sg] = float(np.mean(abs_vals)) if abs_vals else None
+        gb[sg] = float(np.mean(bias_vals)) if bias_vals else None
+        lb.append(f"G{sg}"); ca.append(ga[sg]); cb.append(gb[sg])
+    _draw_error_heatmap(ax, ga, gb, (4, 4), lb, ca, cb)
+
+    # 2x2
+    ax = axes[1][0]
+    ax.set_title("2×2 Group Errors", fontsize=10)
+    ga, gb, lb, ca, cb = {}, {}, [], [], []
+    for sg in range(4):
+        sr, sc = sg // 2, sg % 2
+        abs_vals, bias_vals = [], []
+        for dr in range(4):
+            for dc in range(4):
+                z = (sr*4 + dr)*8 + (sc*4 + dc)
+                if abs_errors.get(z) is not None:
+                    abs_vals.append(abs_errors[z])
+                if bias_errors.get(z) is not None:
+                    bias_vals.append(bias_errors[z])
+        ga[sg] = float(np.mean(abs_vals)) if abs_vals else None
+        gb[sg] = float(np.mean(bias_vals)) if bias_vals else None
+        lb.append(f"G{sg}"); ca.append(ga[sg]); cb.append(gb[sg])
+    _draw_error_heatmap(ax, ga, gb, (2, 2), lb, ca, cb)
+
+    # Rings
+    ax = axes[1][1]
+    ax.set_title("Ring Group Errors", fontsize=10)
+
+    ring_abs  = {0: [], 1: [], 2: [], 3: []}
+    ring_bias = {0: [], 1: [], 2: [], 3: []}
+    for z in range(64):
+        ring = get_ring(z)
+        if abs_errors.get(z) is not None:
+            ring_abs[ring].append(abs_errors[z])
+        if bias_errors.get(z) is not None:
+            ring_bias[ring].append(bias_errors[z])
+
+    ring_abs_means  = {r: (float(np.mean(v)) if v else None) for r, v in ring_abs.items()}
+    ring_bias_means = {r: (float(np.mean(v)) if v else None) for r, v in ring_bias.items()}
+
+    vb = [v for v in ring_bias_means.values() if v is not None]
+    min_bias = min(vb) if vb else 0.0
+    max_bias = max(vb) if vb else 0.0
+
+    for z in range(64):
+        r = z // 8
+        c = z % 8
+        ring = get_ring(z)
+        bias_val = ring_bias_means.get(ring)
+
+        color = _bias_colour(bias_val, min_bias, max_bias) if bias_val is not None else (0.85, 0.85, 0.85, 1.0)
+        rect = mpatches.FancyBboxPatch((c, r), 1, 1, boxstyle="square,pad=0",
+                                       facecolor=color, edgecolor="white", linewidth=0.5)
+        ax.add_patch(rect)
+
+        # top-left of ring k is at (c=k, r=7-k) in no-flip coordinates
+        label_once = (c == ring) and (r == (7 - ring))
+        if label_once:
+            abs_val = ring_abs_means.get(ring)
+            abs_text  = f"{abs_val:.1f}" if abs_val is not None else "N/A"
+            bias_text = f"b:{bias_val:+.1f}" if bias_val is not None else ""
+            ax.text(c + 0.5, r + 0.5, f"{abs_text}\n{bias_text}",
+                    ha="center", va="center", fontsize=7,
+                    color="white", fontweight="bold")
+
+    for ring in range(1, 4):
+        o = ring
+        ax.plot([o, 8-o, 8-o, o, o],
+                [o, o, 8-o, 8-o, o],
+                color="white", linewidth=1.5, linestyle="--")
+
+    legend_elements = [
+        Patch(facecolor="#52A83C", label="Mean |error| ≤ 2mm"),
+        Patch(facecolor="#E8708E", label="Mean error < −2mm"),
+        Patch(facecolor="#2E61A8", label="Mean error > +2mm"),
+    ]
+    fig.legend(handles=legend_elements, loc="upper center", ncol=3,
+               framealpha=0.98, fontsize=9, bbox_to_anchor=(0.5, 0.97))
+
+    ax.set_xlim(0, 8); ax.set_ylim(0, 8)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_aspect("equal")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    save_path = os.path.join(output_path, "MultiExperiment_Error_Heatmaps.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
 
 def generate_multi_experiment_plots_v2(experiment_folders: dict, origin: int, output_path: str) -> str:
     """Convenience entrypoint: load experiments, then produce the v2 plot set."""
@@ -374,6 +630,9 @@ def generate_multi_experiment_plots_v2(experiment_folders: dict, origin: int, ou
 
     print("Generating error and validity plot...")
     plot_multiexp_error_and_validity(experiments, plots_folder)
+
+    print("Generating multi-experiment error heatmaps...")
+    plot_multiexp_error_heatmaps(experiments, plots_folder)
 
     print("Done!")
     return plots_folder
