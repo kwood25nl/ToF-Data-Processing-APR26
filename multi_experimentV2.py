@@ -184,7 +184,6 @@ def plot_multiexp_validity_heatmap(experiments: dict, output_path: str):
 
     ax.set_xlim(0, 8)
     ax.set_ylim(0, 8)
-    ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
 
@@ -979,9 +978,18 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
       - One base color per distance (same palette ordering as Visualize comparative drift style).
       - min/max/mean lines: lighter shade of the distance color
       - regression line: full distance color, thicker
-      - shading between min/max: regression color with alpha=0.60
+      - shading between min/max: regression color with alpha=0.60 (lower to lighten)
+      - If a palette color repeats, the *repeated* distance gets a dashed regression line.
     """
-    # distance palette (same as multi_experiment.py)
+    # Requires in module scope:
+    #   import numpy as np
+    #   import matplotlib.pyplot as plt
+    #   import matplotlib.colors as mcolors
+    #   from scipy import stats as sp_stats
+    # And helpers:
+    #   extract_true_distance()
+    #   _lighten_rgb()
+
     PALETTE = ["#E8708E", "#EDD020", "#E97122", "#52A83C", "#18A5AA", "#55A9D4", "#2E61A8"]
 
     # collect all distances
@@ -997,9 +1005,13 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
     ax = fig.add_subplot(gs[0])
     ax_text = fig.add_subplot(gs[1])
     ax_text.axis("off")
+    ax.tick_params(axis="x", bottom=False, labelbottom=False)
 
     # Store fit slopes for annotation
     slopes = {}
+
+    # track palette reuse to dash repeated distances (like Visualize.py)
+    used_base_hex = {}
 
     for j, dist_key in enumerate(dist_keys):
         true_distance = extract_true_distance(dist_key)
@@ -1039,7 +1051,6 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
 
                 # keep only entries where validity is 0/1; if there is noise, treat non-0/1 as invalid
                 mask01 = (vv == 0) | (vv == 1)
-                # if mask01 is False for some frames, set validity to 0 there
                 vv01 = np.where(mask01, vv, 0)
 
                 dist_stack.append(a)
@@ -1052,7 +1063,6 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
             valid_stack = np.array(valid_stack)   # (Z, T)
 
             # For each t: mean over zones that are valid at t
-            # If no zones valid at a timepoint, set NaN so we can ignore in aggregations
             mean_per_frame = np.empty(T, dtype=float)
             mean_per_frame[:] = np.nan
 
@@ -1083,15 +1093,13 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
         base_rgb = mcolors.to_rgb(base_hex)
         light_rgb = _lighten_rgb(base_rgb, amount=0.55)
 
-        # Shading between min/max: regression color at 60% alpha
-        ax.fill_between(frames, min_line, max_line,
-                        color=(*base_rgb, 0.10), linewidth=0)
+        used_base_hex[base_hex] = used_base_hex.get(base_hex, 0) + 1
+        fit_linestyle = "--" if used_base_hex[base_hex] > 1 else "-"
 
-        # Min/max/mean lines: lighter shade
-        # ax.plot(frames, min_line, color=light_rgb, linewidth=1.5, linestyle="--",
-        #         label=f"{dist_key} min")
-        # ax.plot(frames, max_line, color=light_rgb, linewidth=1.5, linestyle="--",
-        #         label=f"{dist_key} max")
+        # Shading between min/max: regression color at 60% alpha (lower to lighten)
+        ax.fill_between(frames, min_line, max_line,
+                        color=(*base_rgb, 0.20), linewidth=0)
+
         ax.plot(frames, mean_line, color=light_rgb, linewidth=2.0, linestyle="-",
                 label=f"{dist_key} mean")
 
@@ -1101,47 +1109,31 @@ def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
             slope, intercept, _, _, _ = sp_stats.linregress(frames[ok], mean_line[ok])
             slopes[dist_key] = float(slope)
             ax.plot(frames, intercept + slope * frames,
-                    color=base_rgb, linewidth=3.0, linestyle="-",
-                    label=f"{dist_key} : ({slope:+.4f} mm/frame)")
+                    color=base_rgb, linewidth=3.0, linestyle=fit_linestyle,
+                    label=f"{dist_key} :({slope:+.4f} mm/frame)")
         else:
             slopes[dist_key] = None
 
     ax.axhline(0, color="black", linewidth=1.0, linestyle="-", alpha=0.4)
     ax.set_ylabel("Error [mm]", fontsize=10)
     ax.set_xlabel("Time →")
-    ax.set_title("Drift Across experiments\n", pad=30)
+    ax.set_title("Drift Across Experiments\n", pad=60)
 
-    # keep legend reasonable: show one entry per distance (fit)
-    # (matplotlib will otherwise explode because we label min/max/mean too)
+    # Legend above plot but below title: keep ONLY "fit" entries so it stays readable
     handles, labels = ax.get_legend_handles_labels()
-    keep = []
-    seen = set()
+    keep_h, keep_l = [], []
     for h, l in zip(handles, labels):
-        # keep only "fit" labels
-        if "fit" in l and l not in seen:
-            keep.append((h, l))
-            seen.add(l)
-    if keep:
-        ax.legend([h for h, _ in keep], [l for _, l in keep],
-                  fontsize=8, loc="lower center",
-                  bbox_to_anchor=(0.5, 1.02),
-                  ncol=min(4, len(keep)),
-                  borderaxespad=0)
+        if "mm/frame" in l:
+            keep_h.append(h)
+            keep_l.append(l)
 
-    # Annotation block with slopes
-    lines = []
-    # for dist_key in dist_keys:
-    #     s = slopes.get(dist_key)
-    #     if s is None:
-    #         continue
-    #     lines.append(f"{dist_key}: slope {s:+.4f} mm/frame")
-    # if lines:
-    #     ax.annotate("\n".join(lines),
-    #                 xy=(0.5, -0.10),
-    #                 xycoords="axes fraction",
-    #                 ha="center", va="top",
-    #                 fontsize=8,
-    #                 annotation_clip=False)
+    if keep_h:
+        ax.legend(keep_h, keep_l,
+                  fontsize=8,
+                  loc="upper center",
+                  bbox_to_anchor=(0.5, 1.15),  # above axes, below title
+                  ncol=min(4, len(keep_h)),
+                  framealpha=0.95)
 
     save_path = os.path.join(output_path, "MultiExperiment_Drift_Envelope.png")
     plt.savefig(save_path, bbox_inches="tight", dpi=150)
