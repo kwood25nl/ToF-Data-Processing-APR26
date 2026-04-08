@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 
+from scipy import stats as sp_stats
+
 # ── Colours (match Visualize.py) ─────────────────────────────────────────────
 ALWAYS_VALID_COLOR = "#52A83C"
 MOST_VALID_COLOR   = "#F6C6A7"
@@ -83,6 +85,15 @@ def _safe_concat(arr_list):
 
 def _interp_rgb(rgb_a, rgb_b, t: float):
     return tuple(rgb_a[i] * (1 - t) + rgb_b[i] * t for i in range(3))
+
+def _lighten_rgb(rgb, amount: float = 0.5):
+    """
+    Mix color with white.
+    amount=0   -> original
+    amount=1.0 -> white
+    """
+    r, g, b = rgb
+    return (r + (1 - r) * amount, g + (1 - g) * amount, b + (1 - b) * amount)
 
 
 # ── (1) Overall validity heatmap (all distances + experiments concatenated) ───
@@ -949,29 +960,218 @@ def plot_multiexp_tiled_validity(experiments: dict, output_path: str):
         plt.savefig(save_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
 
+def plot_multiexp_drift_envelope(experiments: dict, output_path: str):
+    """
+    Drift plot across experiments per distance with envelope shading.
+
+    For each (distance dist_key):
+      1) For each experiment:
+         - For each frame t, compute mean(distance_mm over zones that are valid at t),
+           i.e. validity mask applied per-frame per-zone.
+         - Convert to error vs true distance: mean_measured[t] - true_distance
+      2) Across experiments (at each t):
+         - min line, max line
+         - mean-of-means line
+      3) Fit a linear regression to mean-of-means line (error vs frame)
+         and plot it as a thicker line.
+
+    Color scheme:
+      - One base color per distance (same palette ordering as Visualize comparative drift style).
+      - min/max/mean lines: lighter shade of the distance color
+      - regression line: full distance color, thicker
+      - shading between min/max: regression color with alpha=0.60
+    """
+    # distance palette (same as multi_experiment.py)
+    PALETTE = ["#E8708E", "#EDD020", "#E97122", "#52A83C", "#18A5AA", "#55A9D4", "#2E61A8"]
+
+    # collect all distances
+    all_dist_keys = set()
+    for _exp_name, (trimmed, _n_frames, _shortest) in experiments.items():
+        all_dist_keys.update(trimmed.keys())
+    dist_keys = sorted(all_dist_keys, key=extract_true_distance)
+    if not dist_keys:
+        return
+
+    fig = plt.figure(figsize=(14, 9))
+    gs = plt.GridSpec(2, 1, height_ratios=[10, 2], hspace=0.05)
+    ax = fig.add_subplot(gs[0])
+    ax_text = fig.add_subplot(gs[1])
+    ax_text.axis("off")
+
+    # Store fit slopes for annotation
+    slopes = {}
+
+    for j, dist_key in enumerate(dist_keys):
+        true_distance = extract_true_distance(dist_key)
+
+        # Per-experiment time series of mean(valid zones per frame)
+        exp_series = []
+
+        for _exp_name, (trimmed, _n_frames, _shortest) in experiments.items():
+            if dist_key not in trimmed:
+                continue
+            zone_data = trimmed[dist_key]
+
+            # find a common length for this experiment at this distance
+            zone_lengths = []
+            for z in range(64):
+                arr = zone_data.get("distance_mm", {}).get(z)
+                v = zone_data.get("is_valid_range", {}).get(z)
+                if arr is None or v is None:
+                    continue
+                zone_lengths.append(min(len(arr), len(v)))
+
+            if not zone_lengths:
+                continue
+
+            T = min(zone_lengths)
+
+            # build arrays: dist_stack (n_zones, T), valid_stack (n_zones, T)
+            dist_stack = []
+            valid_stack = []
+            for z in range(64):
+                arr = zone_data.get("distance_mm", {}).get(z)
+                v = zone_data.get("is_valid_range", {}).get(z)
+                if arr is None or v is None:
+                    continue
+                a = np.asarray(arr)[:T]
+                vv = np.asarray(v)[:T]
+
+                # keep only entries where validity is 0/1; if there is noise, treat non-0/1 as invalid
+                mask01 = (vv == 0) | (vv == 1)
+                # if mask01 is False for some frames, set validity to 0 there
+                vv01 = np.where(mask01, vv, 0)
+
+                dist_stack.append(a)
+                valid_stack.append(vv01)
+
+            if not dist_stack:
+                continue
+
+            dist_stack = np.array(dist_stack)     # (Z, T)
+            valid_stack = np.array(valid_stack)   # (Z, T)
+
+            # For each t: mean over zones that are valid at t
+            # If no zones valid at a timepoint, set NaN so we can ignore in aggregations
+            mean_per_frame = np.empty(T, dtype=float)
+            mean_per_frame[:] = np.nan
+
+            for t in range(T):
+                mask = (valid_stack[:, t] == 1)
+                if np.any(mask):
+                    mean_per_frame[t] = float(np.mean(dist_stack[mask, t]))
+
+            # Convert to error vs true distance
+            err_per_frame = mean_per_frame - true_distance
+            exp_series.append(err_per_frame)
+
+        if not exp_series:
+            continue
+
+        # Align all experiments for this distance by shortest length (so min/max/mean line up)
+        min_T = min(len(s) for s in exp_series)
+        S = np.array([s[:min_T] for s in exp_series], dtype=float)  # (E, T)
+
+        # Per-frame envelopes ignoring NaNs
+        min_line = np.nanmin(S, axis=0)
+        max_line = np.nanmax(S, axis=0)
+        mean_line = np.nanmean(S, axis=0)
+
+        frames = np.arange(min_T)
+
+        base_hex = PALETTE[j % len(PALETTE)]
+        base_rgb = mcolors.to_rgb(base_hex)
+        light_rgb = _lighten_rgb(base_rgb, amount=0.55)
+
+        # Shading between min/max: regression color at 60% alpha
+        ax.fill_between(frames, min_line, max_line,
+                        color=(*base_rgb, 0.10), linewidth=0)
+
+        # Min/max/mean lines: lighter shade
+        # ax.plot(frames, min_line, color=light_rgb, linewidth=1.5, linestyle="--",
+        #         label=f"{dist_key} min")
+        # ax.plot(frames, max_line, color=light_rgb, linewidth=1.5, linestyle="--",
+        #         label=f"{dist_key} max")
+        ax.plot(frames, mean_line, color=light_rgb, linewidth=2.0, linestyle="-",
+                label=f"{dist_key} mean")
+
+        # Regression on mean line (ignore NaNs)
+        ok = np.isfinite(mean_line)
+        if np.sum(ok) >= 2:
+            slope, intercept, _, _, _ = sp_stats.linregress(frames[ok], mean_line[ok])
+            slopes[dist_key] = float(slope)
+            ax.plot(frames, intercept + slope * frames,
+                    color=base_rgb, linewidth=3.0, linestyle="-",
+                    label=f"{dist_key} : ({slope:+.4f} mm/frame)")
+        else:
+            slopes[dist_key] = None
+
+    ax.axhline(0, color="black", linewidth=1.0, linestyle="-", alpha=0.4)
+    ax.set_ylabel("Error [mm]", fontsize=10)
+    ax.set_xlabel("Time →")
+    ax.set_title("Drift Across experiments\n", pad=30)
+
+    # keep legend reasonable: show one entry per distance (fit)
+    # (matplotlib will otherwise explode because we label min/max/mean too)
+    handles, labels = ax.get_legend_handles_labels()
+    keep = []
+    seen = set()
+    for h, l in zip(handles, labels):
+        # keep only "fit" labels
+        if "fit" in l and l not in seen:
+            keep.append((h, l))
+            seen.add(l)
+    if keep:
+        ax.legend([h for h, _ in keep], [l for _, l in keep],
+                  fontsize=8, loc="lower center",
+                  bbox_to_anchor=(0.5, 1.02),
+                  ncol=min(4, len(keep)),
+                  borderaxespad=0)
+
+    # Annotation block with slopes
+    lines = []
+    # for dist_key in dist_keys:
+    #     s = slopes.get(dist_key)
+    #     if s is None:
+    #         continue
+    #     lines.append(f"{dist_key}: slope {s:+.4f} mm/frame")
+    # if lines:
+    #     ax.annotate("\n".join(lines),
+    #                 xy=(0.5, -0.10),
+    #                 xycoords="axes fraction",
+    #                 ha="center", va="top",
+    #                 fontsize=8,
+    #                 annotation_clip=False)
+
+    save_path = os.path.join(output_path, "MultiExperiment_Drift_Envelope.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
 
 # ── Master entrypoint ─────────────────────────────────────────────────────────
 def generate_multi_experiment_plots_v2(experiment_folders: dict, origin: int, output_path: str) -> str:
     experiments = load_multi_experiment(experiment_folders, origin)
     plots_folder = setup_output_folder(output_path, "multiV2")
 
-    print("Generating concatenated overall validity heatmap...")
-    plot_multiexp_validity_heatmap(experiments, plots_folder)
+    # print("Generating concatenated overall validity heatmap...")
+    # plot_multiexp_validity_heatmap(experiments, plots_folder)
+    #
+    # print("Generating error and validity plot...")
+    # plot_multiexp_error_and_validity(experiments, plots_folder)
+    #
+    # print("Generating multi-experiment error heatmaps...")
+    # plot_multiexp_error_heatmaps(experiments, plots_folder)
+    #
+    # print("Generating per-distance heatmaps (multi-experiment, valid-only)...")
+    # plot_multiexp_per_distance_heatmaps(experiments, plots_folder)
+    #
+    # print("Generating per-distance tiled boxplots (multi-experiment, includes invalid measurements)...")
+    # plot_multiexp_tiled_boxplots(experiments, plots_folder)
+    #
+    # print("Generating per-distance tiled validity plots (multi-experiment)...")
+    # plot_multiexp_tiled_validity(experiments, plots_folder)
 
-    print("Generating error and validity plot...")
-    plot_multiexp_error_and_validity(experiments, plots_folder)
-
-    print("Generating multi-experiment error heatmaps...")
-    plot_multiexp_error_heatmaps(experiments, plots_folder)
-
-    print("Generating per-distance heatmaps (multi-experiment, valid-only)...")
-    plot_multiexp_per_distance_heatmaps(experiments, plots_folder)
-
-    print("Generating per-distance tiled boxplots (multi-experiment, includes invalid measurements)...")
-    plot_multiexp_tiled_boxplots(experiments, plots_folder)
-
-    print("Generating per-distance tiled validity plots (multi-experiment)...")
-    plot_multiexp_tiled_validity(experiments, plots_folder)
+    print("Generating drift envelope plot...")
+    plot_multiexp_drift_envelope(experiments, plots_folder)
 
     print("Done!")
     return plots_folder
