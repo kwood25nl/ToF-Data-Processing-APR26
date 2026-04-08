@@ -100,7 +100,7 @@ def draw_heatmap(ax, means, true_distance, grid_shape, zone_labels, cell_means):
     for i, (label, mean_val) in enumerate(zip(zone_labels, cell_means)):
         r = i // cols
         c = i % cols
-        r = (rows - 1) - r
+        # No row flip: y=0 is bottom in matplotlib data coordinates.
         color = colour_for_value(mean_val, true_distance, min_val, max_val) \
                 if mean_val is not None else (0.85, 0.85, 0.85, 1.0)
         rect = mpatches.FancyBboxPatch(
@@ -310,7 +310,7 @@ def comparative_tiled_heatmaps(experiments: dict, output_path: str):
             for z in range(64):
                 r, c   = z // 8, z % 8
                 ring   = get_ring(z)
-                plot_r = 7 - r
+                plot_r = r
                 mv     = rm.get(ring)
                 color  = colour_for_value(mv, true_distance, min_v, max_v) \
                          if mv is not None else (0.85, 0.85, 0.85, 1.0)
@@ -724,7 +724,7 @@ def comparative_error_heatmaps(experiments: dict, output_path: str):
                 zip(labels, cell_abs, cell_bias)):
             r = i // cols
             c = i % cols
-            r = (rows - 1) - r
+            # No row flip: y=0 is bottom in matplotlib data coordinates.
             color = bias_colour(bias_val, min_bias, max_bias) \
                     if bias_val is not None else (0.85, 0.85, 0.85, 1.0)
             rect = mpatches.FancyBboxPatch(
@@ -858,7 +858,7 @@ def comparative_error_heatmaps(experiments: dict, output_path: str):
         for z in range(64):
             r, c   = z // 8, z % 8
             ring   = get_ring(z)
-            plot_r = 7 - r
+            plot_r = r
             bv     = rbm.get(ring)
             av     = ram.get(ring)
             color  = bias_colour(bv, mn, mx) \
@@ -922,7 +922,7 @@ def comparative_overall_validity(experiments: dict, output_path: str):
         for z in range(64):
             r      = z // 8
             c      = z % 8
-            plot_r = 7 - r
+            plot_r = r
             pct    = zone_mean_validity.get(z)
 
             if pct is None or pct >= 100.0:
