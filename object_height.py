@@ -94,8 +94,8 @@ def _load_zone_data_from_folder(folder_path: str) -> Optional[dict]:
     The folder must contain exactly one file whose name starts with ``"data"``
     and ends with ``".csv"``.  The CSV is expected to have columns named::
 
-        distance_mm_z{N}        (N = 0 … 63)
-        .is_valid_range_z{N}    (N = 0 … 63)
+        distance_mm_z{N}        (N = 0 ... 63)
+        .is_valid_range_z{N}    (N = 0 ... 63)
 
     which is the format produced by the existing experiment pipeline.
 
