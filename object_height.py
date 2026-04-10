@@ -49,6 +49,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – registers 3-D projection
 
 # ── Folder name regex ─────────────────────────────────────────────────────────
 _FOLDER_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
@@ -185,6 +186,130 @@ def compute_zone_valid_means(zone_data: dict) -> dict[int, Optional[float]]:
         else:
             means[z] = None
     return means
+
+
+# ── 3-D heatmap computation and plotting ─────────────────────────────────────
+
+def compute_zone_heights(
+    zone_means: dict[int, Optional[float]],
+    tolerance_mm: float = 2.0,
+) -> dict[int, Optional[float]]:
+    """
+    Convert per-zone mean distances to object-height values for a 3-D plot.
+
+    Algorithm
+    ~~~~~~~~~
+    1. Find the **maximum** valid mean distance (``d_max``).
+    2. Any zone whose mean distance is within *tolerance_mm* of ``d_max`` is
+       considered part of the background and is assigned a height of **0**.
+    3. All other valid zones get ``height = d_max - zone_mean``.
+       (A closer zone → larger height.)
+    4. Zones with no valid data remain ``None``.
+
+    Args:
+        zone_means:    Dict of ``zone_index -> mean_distance_mm`` as returned
+                       by :func:`compute_zone_valid_means`.
+        tolerance_mm:  Distance tolerance for background classification.
+                       Defaults to 2 mm.
+
+    Returns:
+        Dict of ``zone_index -> height_mm`` (or ``None`` for invalid zones).
+    """
+    valid_vals = [v for v in zone_means.values() if v is not None]
+    if not valid_vals:
+        return {z: None for z in zone_means}
+
+    d_max = max(valid_vals)
+    heights: dict[int, Optional[float]] = {}
+    for z, mean in zone_means.items():
+        if mean is None:
+            heights[z] = None
+        elif abs(mean - d_max) <= tolerance_mm:
+            heights[z] = 0.0
+        else:
+            heights[z] = d_max - mean
+    return heights
+
+
+def plot_3d_heatmap(
+    folder_id: str,
+    zone_heights: dict[int, Optional[float]],
+    output_path: Optional[str] = None,
+) -> None:
+    """
+    Plot a 3-D bar chart where each ToF zone is a bar whose height represents
+    the derived object height (``d_max - zone_mean``).
+
+    Background zones (within 2 mm of the farthest distance) have height 0.
+    Bars are coloured by height using the ``plasma`` colormap.
+
+    Args:
+        folder_id:    Folder identifier string (e.g. ``"ob150"``).
+        zone_heights: Dict of ``zone_index -> height_mm`` as returned by
+                      :func:`compute_zone_heights`.
+        output_path:  If provided, save the figure as
+                      ``{output_path}/{folder_id}_3DHeatmap.png`` and close it.
+                      If ``None``, display interactively.
+    """
+    colormap = plt.cm.plasma  # type: ignore[attr-defined]
+
+    heights_flat = np.array(
+        [zone_heights.get(z, 0.0) or 0.0 for z in range(64)],
+        dtype=float,
+    )
+
+    h_max = float(heights_flat.max())
+    h_min = 0.0
+    norm = mcolors.Normalize(vmin=h_min, vmax=max(h_max, 1.0))
+
+    # Grid positions: zone index = row*8 + col, row 0 at top in 2-D view
+    xpos = np.array([z % 8 for z in range(64)], dtype=float)
+    ypos = np.array([z // 8 for z in range(64)], dtype=float)
+    zpos = np.zeros(64, dtype=float)
+
+    dx = dy = np.full(64, 0.8, dtype=float)
+    dz = heights_flat
+
+    colors = colormap(norm(dz))
+
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection="3d")
+
+    ax.bar3d(
+        xpos - 0.4, ypos - 0.4, zpos,
+        dx, dy, dz,
+        color=colors,
+        shade=True,
+        edgecolor="white",
+        linewidth=0.3,
+    )
+
+    ax.set_xlabel("Column (0–7)", labelpad=8)
+    ax.set_ylabel("Row (0–7)", labelpad=8)
+    ax.set_zlabel("Height (mm)", labelpad=8)
+    ax.set_title(
+        f"3-D Object Height Heatmap — {folder_id}\n"
+        "(height = farthest distance − zone mean; background zones = 0)",
+        fontsize=11,
+    )
+
+    ax.set_xticks(range(8))
+    ax.set_yticks(range(8))
+    ax.view_init(elev=30, azim=-60)
+
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.1, label="Height (mm)")
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        save_path = os.path.join(output_path, f"{folder_id}_3DHeatmap.png")
+        plt.savefig(save_path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        print(f"Saved: {save_path}")
+    else:
+        plt.show()
 
 
 # ── Heatmap plotting helpers ──────────────────────────────────────────────────
@@ -506,6 +631,13 @@ def analyse_measured_distances(
         plot_measured_distance_heatmaps(
             folder_id=entry.name,
             zone_means=zone_means,
+            output_path=actual_save_dir,
+        )
+
+        zone_heights = compute_zone_heights(zone_means)
+        plot_3d_heatmap(
+            folder_id=entry.name,
+            zone_heights=zone_heights,
             output_path=actual_save_dir,
         )
 
