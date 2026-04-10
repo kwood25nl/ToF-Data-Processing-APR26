@@ -292,9 +292,9 @@ def plot_3d_heatmap(
         ``{output_path}/{folder_id}_3DHeatmap.png``.
 
     Interactive HTML
-        A plotly ``Surface`` figure saved as
+        A plotly ``Mesh3d`` figure saved as
         ``{output_path}/{folder_id}_3DHeatmap.html``.
-        Open this file in any browser to orbit, zoom and pan the surface
+        Open this file in any browser to orbit, zoom and pan the cubes
         freely with the mouse.
 
     Both figures colour-encode height using the ``plasma`` palette.  When
@@ -358,18 +358,82 @@ def plot_3d_heatmap(
     else:
         plt.show()
 
-    # ── Interactive plotly surface (orbitable in browser) ────────────────────
-    rows = list(range(8))
-    cols = list(range(8))
+    # ── Interactive plotly cubes (orbitable in browser) ──────────────────────
+    # Build explicit box geometry (8 vertices + 12 triangles per zone bar) so
+    # the HTML output renders individual cubes matching the static matplotlib
+    # bar3d chart rather than a smooth interpolated surface.
+    all_x: list[float] = []
+    all_y: list[float] = []
+    all_z: list[float] = []
+    all_i: list[int] = []
+    all_j: list[int] = []
+    all_k: list[int] = []
+    all_intensity: list[float] = []
+    hover_x: list[float] = []
+    hover_y: list[float] = []
+    hover_z: list[float] = []
+    hover_text: list[str] = []
+
+    for row, col, h in grid:
+        x0, x1 = col - 0.4, col + 0.4
+        y0, y1 = row - 0.4, row + 0.4
+        z0, z1 = 0.0, max(float(h), 0.0)
+
+        base = len(all_x)
+        # 8 corners of the box
+        all_x.extend([x0, x1, x1, x0, x0, x1, x1, x0])
+        all_y.extend([y0, y0, y1, y1, y0, y0, y1, y1])
+        all_z.extend([z0, z0, z0, z0, z1, z1, z1, z1])
+        all_intensity.extend([float(h)] * 8)
+
+        # 6 faces as 12 triangles
+        face_indices = [
+            (0, 1, 2), (0, 2, 3),  # bottom
+            (4, 5, 6), (4, 6, 7),  # top
+            (0, 1, 5), (0, 5, 4),  # front
+            (2, 3, 7), (2, 7, 6),  # back
+            (0, 3, 7), (0, 7, 4),  # left
+            (1, 2, 6), (1, 6, 5),  # right
+        ]
+        for a, b, c in face_indices:
+            all_i.append(base + a)
+            all_j.append(base + b)
+            all_k.append(base + c)
+
+        # Hover marker at the top-centre of each bar
+        hover_x.append(float(col))
+        hover_y.append(float(row))
+        hover_z.append(z1)
+        hover_text.append(f"Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
+
     plotly_fig = go.Figure(
-        data=go.Surface(
-            z=height_matrix,
-            x=cols,
-            y=rows,
-            colorscale="Plasma",
-            colorbar=dict(title="Height (mm)"),
-            hovertemplate="Col: %{x}<br>Row: %{y}<br>Height: %{z:.2f} mm<extra></extra>",
-        )
+        data=[
+            go.Mesh3d(
+                x=all_x,
+                y=all_y,
+                z=all_z,
+                i=all_i,
+                j=all_j,
+                k=all_k,
+                intensity=all_intensity,
+                intensitymode="vertex",
+                colorscale="Plasma",
+                colorbar=dict(title="Height (mm)"),
+                showscale=True,
+                flatshading=True,
+                lighting=dict(ambient=0.7, diffuse=0.5),
+            ),
+            go.Scatter3d(
+                x=hover_x,
+                y=hover_y,
+                z=hover_z,
+                mode="markers",
+                marker=dict(size=3, color="rgba(0,0,0,0)"),
+                hovertemplate="%{text}<extra></extra>",
+                text=hover_text,
+                showlegend=False,
+            ),
+        ]
     )
     plotly_fig.update_layout(
         title=dict(
