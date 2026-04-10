@@ -56,6 +56,9 @@ from stl import mesh as stl_mesh
 # ── Folder name regex ─────────────────────────────────────────────────────────
 _FOLDER_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
+# Minimum bar height (mm) for background zones in the STL so the floor is visible.
+_STL_FLOOR_HEIGHT_MM: float = 0.1
+
 
 # ── Output folder setup ───────────────────────────────────────────────────────
 
@@ -63,7 +66,7 @@ def setup_output_folder(output_path: str) -> str:
     """
     Create a timestamped output subfolder inside *output_path*.
 
-    The subfolder is named ``2D heatmaps-{YYYYMMDD_HHMMSS}`` and is created
+    The subfolder is named ``outputs-{YYYYMMDD_HHMMSS}`` and is created
     with ``exist_ok=False`` so each run always gets a unique directory.
 
     Args:
@@ -73,7 +76,7 @@ def setup_output_folder(output_path: str) -> str:
         Full path to the newly created timestamped subfolder.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    full_path = os.path.join(output_path, f"2D heatmaps-{timestamp}")
+    full_path = os.path.join(output_path, f"outputs-{timestamp}")
     os.makedirs(full_path, exist_ok=False)
     return full_path
 
@@ -237,8 +240,11 @@ class ZoneHeightGrid:
     """
     Iterable view over an 8×8 ToF sensor height grid.
 
-    Yields ``(row, col, height_mm)`` tuples when iterated, where ``None``
-    heights are replaced with ``0.0``.  Supports repeated iteration.
+    Each call to ``__iter__`` returns a **fresh generator**, so the object is
+    safely re-iterable and multiple simultaneous iterators can coexist.
+
+    Yields ``(row, col, height_mm)`` tuples, where ``None`` heights are
+    replaced with ``0.0``.
 
     Args:
         zone_heights: Dict of ``zone_index -> height_mm`` as returned by
@@ -250,28 +256,20 @@ class ZoneHeightGrid:
         for row, col, h in grid:
             print(row, col, h)
 
-        # or use next() / list()
+        # next() still works via iter()
         it = iter(grid)
         first = next(it)
     """
 
     def __init__(self, zone_heights: dict[int, Optional[float]]) -> None:
         self._heights = zone_heights
-        self._index = 0
 
-    def __iter__(self) -> "ZoneHeightGrid":
-        self._index = 0
-        return self
-
-    def __next__(self) -> tuple[int, int, float]:
-        if self._index >= 64:
-            raise StopIteration
-        z = self._index
-        self._index += 1
-        row = z // 8
-        col = z % 8
-        h = self._heights.get(z)
-        return row, col, 0.0 if h is None else h
+    def __iter__(self):
+        for z in range(64):
+            row = z // 8
+            col = z % 8
+            h = self._heights.get(z)
+            yield row, col, 0.0 if h is None else h
 
     def as_matrix(self) -> np.ndarray:
         """Return the heights as an 8×8 numpy array (row-major, None → 0)."""
@@ -455,15 +453,13 @@ def export_stl(
     diagonal_mm = 1.2741 * standoff
     cell_mm = diagonal_mm / (8.0 * np.sqrt(2.0))
 
-    FLOOR_H = 0.1  # mm – minimum height for background tiles
-
     grid = ZoneHeightGrid(zone_heights)
 
     # Build triangle list: 12 triangles per box = 12 × 3 vertices per zone
     triangles: list[np.ndarray] = []
 
     for row, col, h in grid:
-        bar_h = h if h > 0.0 else FLOOR_H
+        bar_h = h if h > 0.0 else _STL_FLOOR_HEIGHT_MM
         x0 = col * cell_mm
         x1 = x0 + cell_mm
         y0 = row * cell_mm
