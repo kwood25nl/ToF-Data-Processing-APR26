@@ -49,7 +49,9 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 – registers 3-D projection
+from stl import mesh as stl_mesh
 
 # ── Folder name regex ─────────────────────────────────────────────────────────
 _FOLDER_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
@@ -231,50 +233,101 @@ def compute_zone_heights(
     return heights
 
 
+class ZoneHeightGrid:
+    """
+    Iterable view over an 8×8 ToF sensor height grid.
+
+    Yields ``(row, col, height_mm)`` tuples when iterated, where ``None``
+    heights are replaced with ``0.0``.  Supports repeated iteration.
+
+    Args:
+        zone_heights: Dict of ``zone_index -> height_mm`` as returned by
+                      :func:`compute_zone_heights`.
+
+    Example::
+
+        grid = ZoneHeightGrid(zone_heights)
+        for row, col, h in grid:
+            print(row, col, h)
+
+        # or use next() / list()
+        it = iter(grid)
+        first = next(it)
+    """
+
+    def __init__(self, zone_heights: dict[int, Optional[float]]) -> None:
+        self._heights = zone_heights
+        self._index = 0
+
+    def __iter__(self) -> "ZoneHeightGrid":
+        self._index = 0
+        return self
+
+    def __next__(self) -> tuple[int, int, float]:
+        if self._index >= 64:
+            raise StopIteration
+        z = self._index
+        self._index += 1
+        row = z // 8
+        col = z % 8
+        h = self._heights.get(z)
+        return row, col, 0.0 if h is None else h
+
+    def as_matrix(self) -> np.ndarray:
+        """Return the heights as an 8×8 numpy array (row-major, None → 0)."""
+        mat = np.zeros((8, 8), dtype=float)
+        for row, col, h in self:
+            mat[row, col] = h
+        return mat
+
+
 def plot_3d_heatmap(
     folder_id: str,
     zone_heights: dict[int, Optional[float]],
     output_path: Optional[str] = None,
 ) -> None:
     """
-    Plot a 3-D bar chart where each ToF zone is a bar whose height represents
-    the derived object height (``d_max - zone_mean``).
+    Produce two 3-D height-map visualisations for the given zone heights.
 
-    Background zones (within 2 mm of the farthest distance) have height 0.
-    Bars are coloured by height using the ``plasma`` colormap.
+    Static PNG
+        A matplotlib ``bar3d`` figure saved as
+        ``{output_path}/{folder_id}_3DHeatmap.png``.
+
+    Interactive HTML
+        A plotly ``Surface`` figure saved as
+        ``{output_path}/{folder_id}_3DHeatmap.html``.
+        Open this file in any browser to orbit, zoom and pan the surface
+        freely with the mouse.
+
+    Both figures colour-encode height using the ``plasma`` palette.  When
+    *output_path* is ``None`` the matplotlib figure is shown interactively
+    and no HTML file is written.
 
     Args:
         folder_id:    Folder identifier string (e.g. ``"ob150"``).
         zone_heights: Dict of ``zone_index -> height_mm`` as returned by
                       :func:`compute_zone_heights`.
-        output_path:  If provided, save the figure as
-                      ``{output_path}/{folder_id}_3DHeatmap.png`` and close it.
-                      If ``None``, display interactively.
+        output_path:  Directory in which to save the two output files.
+                      If ``None``, the matplotlib plot is displayed
+                      interactively.
     """
+    grid = ZoneHeightGrid(zone_heights)
+    height_matrix = grid.as_matrix()
+
     colormap = plt.cm.plasma  # type: ignore[attr-defined]
+    h_max = float(height_matrix.max())
+    norm = mcolors.Normalize(vmin=0.0, vmax=max(h_max, 1.0))
 
-    heights_flat = np.array(
-        [zone_heights.get(z, 0.0) or 0.0 for z in range(64)],
-        dtype=float,
-    )
-
-    h_max = float(heights_flat.max())
-    h_min = 0.0
-    norm = mcolors.Normalize(vmin=h_min, vmax=max(h_max, 1.0))
-
-    # Grid positions: zone index = row*8 + col, row 0 at top in 2-D view
-    xpos = np.array([z % 8 for z in range(64)], dtype=float)
-    ypos = np.array([z // 8 for z in range(64)], dtype=float)
+    # ── Static matplotlib bar-chart ──────────────────────────────────────────
+    xpos = np.array([col for _, col, _ in grid], dtype=float)
+    ypos = np.array([row for row, _, _ in grid], dtype=float)
+    dz   = np.array([h   for _, _, h   in grid], dtype=float)
     zpos = np.zeros(64, dtype=float)
-
     dx = dy = np.full(64, 0.8, dtype=float)
-    dz = heights_flat
-
     colors = colormap(norm(dz))
 
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection="3d")
-
     ax.bar3d(
         xpos - 0.4, ypos - 0.4, zpos,
         dx, dy, dz,
@@ -283,7 +336,6 @@ def plot_3d_heatmap(
         edgecolor="white",
         linewidth=0.3,
     )
-
     ax.set_xlabel("Column (0–7)", labelpad=8)
     ax.set_ylabel("Row (0–7)", labelpad=8)
     ax.set_zlabel("Height (mm)", labelpad=8)
@@ -292,24 +344,177 @@ def plot_3d_heatmap(
         "(height = farthest distance − zone mean; background zones = 0)",
         fontsize=11,
     )
-
     ax.set_xticks(range(8))
     ax.set_yticks(range(8))
     ax.view_init(elev=30, azim=-60)
-
     sm = plt.cm.ScalarMappable(cmap=colormap, norm=norm)
     sm.set_array([])
     fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.1, label="Height (mm)")
-
     fig.tight_layout()
 
     if output_path is not None:
-        save_path = os.path.join(output_path, f"{folder_id}_3DHeatmap.png")
-        plt.savefig(save_path, bbox_inches="tight", dpi=150)
+        png_path = os.path.join(output_path, f"{folder_id}_3DHeatmap.png")
+        plt.savefig(png_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
-        print(f"Saved: {save_path}")
+        print(f"Saved: {png_path}")
     else:
         plt.show()
+
+    # ── Interactive plotly surface (orbitable in browser) ────────────────────
+    rows = list(range(8))
+    cols = list(range(8))
+    plotly_fig = go.Figure(
+        data=go.Surface(
+            z=height_matrix,
+            x=cols,
+            y=rows,
+            colorscale="Plasma",
+            colorbar=dict(title="Height (mm)"),
+            hovertemplate="Col: %{x}<br>Row: %{y}<br>Height: %{z:.2f} mm<extra></extra>",
+        )
+    )
+    plotly_fig.update_layout(
+        title=dict(
+            text=(
+                f"3-D Object Height Heatmap — {folder_id}<br>"
+                "<sup>height = farthest distance − zone mean; background zones = 0</sup>"
+            ),
+            x=0.5,
+        ),
+        scene=dict(
+            xaxis_title="Column (0–7)",
+            yaxis_title="Row (0–7)",
+            zaxis_title="Height (mm)",
+            camera=dict(eye=dict(x=1.5, y=-1.5, z=1.2)),
+        ),
+        margin=dict(l=0, r=0, b=0, t=60),
+    )
+
+    if output_path is not None:
+        html_path = os.path.join(output_path, f"{folder_id}_3DHeatmap.html")
+        plotly_fig.write_html(html_path, include_plotlyjs="cdn")
+        print(f"Saved (orbitable): {html_path}")
+
+
+def export_stl(
+    folder_id: str,
+    zone_heights: dict[int, Optional[float]],
+    platform_h_mm: float,
+    sensor_z_mm: float = 330.0,
+    output_path: Optional[str] = None,
+) -> None:
+    """
+    Export the 3-D height map as a binary STL file.
+
+    Physical scaling
+    ~~~~~~~~~~~~~~~~
+    The ToF sensor's field-of-view means that at a stand-off distance of
+    ``(sensor_z_mm - platform_h_mm)`` mm the 8×8 zone grid spans a square
+    whose **diagonal** equals::
+
+        diagonal = 1.2741 × (sensor_z_mm − platform_h_mm)   [mm]
+
+    From that diagonal the side of the square grid is
+    ``diagonal / √2``, and each of the 8 cells along one axis has side::
+
+        cell_mm = diagonal / (8 × √2)
+
+    Heights (z axis) are kept in millimetres as computed by
+    :func:`compute_zone_heights`.
+
+    Geometry
+    ~~~~~~~~
+    Each zone is extruded as a rectangular prism (box):
+
+    * Zones with height > 0 are extruded to their full computed height.
+    * Zones with height == 0 (background) receive a 0.1 mm floor tile so
+      the base of the scan area is visible in the mesh.
+
+    The resulting mesh is a collection of closed boxes – suitable for
+    slicing or further CAD work.
+
+    Args:
+        folder_id:      Folder identifier (used in the output filename).
+        zone_heights:   Dict of ``zone_index -> height_mm`` from
+                        :func:`compute_zone_heights`.
+        platform_h_mm:  Height of the measurement platform in mm (the
+                        ``NNN`` component of the ``AANNN`` folder name).
+        sensor_z_mm:    Distance from sensor origin to the floor in mm.
+                        Defaults to 330 mm.
+        output_path:    Directory in which to write
+                        ``{folder_id}_3DHeatmap.stl``.  If ``None``, the
+                        file is written to the current working directory.
+    """
+    standoff = sensor_z_mm - platform_h_mm
+    if standoff <= 0:
+        raise ValueError(
+            f"sensor_z_mm ({sensor_z_mm}) must be greater than "
+            f"platform_h_mm ({platform_h_mm})."
+        )
+
+    diagonal_mm = 1.2741 * standoff
+    cell_mm = diagonal_mm / (8.0 * np.sqrt(2.0))
+
+    FLOOR_H = 0.1  # mm – minimum height for background tiles
+
+    grid = ZoneHeightGrid(zone_heights)
+
+    # Build triangle list: 12 triangles per box = 12 × 3 vertices per zone
+    triangles: list[np.ndarray] = []
+
+    for row, col, h in grid:
+        bar_h = h if h > 0.0 else FLOOR_H
+        x0 = col * cell_mm
+        x1 = x0 + cell_mm
+        y0 = row * cell_mm
+        y1 = y0 + cell_mm
+        z0 = 0.0
+        z1 = bar_h
+
+        # 8 box corners
+        v = np.array([
+            [x0, y0, z0],  # 0 bottom-front-left
+            [x1, y0, z0],  # 1 bottom-front-right
+            [x1, y1, z0],  # 2 bottom-back-right
+            [x0, y1, z0],  # 3 bottom-back-left
+            [x0, y0, z1],  # 4 top-front-left
+            [x1, y0, z1],  # 5 top-front-right
+            [x1, y1, z1],  # 6 top-back-right
+            [x0, y1, z1],  # 7 top-back-left
+        ], dtype=np.float32)
+
+        faces = [
+            # bottom (outward normal −Z)
+            [v[0], v[2], v[1]],
+            [v[0], v[3], v[2]],
+            # top (outward normal +Z)
+            [v[4], v[5], v[6]],
+            [v[4], v[6], v[7]],
+            # front (−Y)
+            [v[0], v[1], v[5]],
+            [v[0], v[5], v[4]],
+            # right (+X)
+            [v[1], v[2], v[6]],
+            [v[1], v[6], v[5]],
+            # back (+Y)
+            [v[2], v[3], v[7]],
+            [v[2], v[7], v[6]],
+            # left (−X)
+            [v[3], v[0], v[4]],
+            [v[3], v[4], v[7]],
+        ]
+        triangles.extend(faces)
+
+    n = len(triangles)
+    solid = stl_mesh.Mesh(np.zeros(n, dtype=stl_mesh.Mesh.dtype))
+    for i, tri in enumerate(triangles):
+        for j in range(3):
+            solid.vectors[i][j] = tri[j]
+
+    save_dir = output_path if output_path is not None else os.getcwd()
+    stl_path = os.path.join(save_dir, f"{folder_id}_3DHeatmap.stl")
+    solid.save(stl_path)
+    print(f"Saved (STL): {stl_path}")
 
 
 # ── Heatmap plotting helpers ──────────────────────────────────────────────────
@@ -573,6 +778,7 @@ def plot_measured_distance_heatmaps(
 def analyse_measured_distances(
     data_root: str,
     save_dir: Optional[str] = None,
+    sensor_z_mm: float = 330.0,
 ) -> dict[str, dict[int, Optional[float]]]:
     """
     Discover ``AANNN`` subfolders in ``data_root``, compute per-zone mean
@@ -584,11 +790,18 @@ def analyse_measured_distances(
     ``AANNN`` naming pattern (letters then digits) are processed.  Others are
     skipped with a warning.
 
+    For each folder the ``NNN`` numeric suffix is used as the platform height
+    (in mm) when computing the physical grid size for the STL export.
+
     Args:
-        data_root: Root directory containing ``AANNN`` data subfolders.
-        save_dir:  Directory to write output ``*_MeasuredDistance.png`` files.
-                   Created automatically if it does not exist.  If ``None``,
-                   figures are shown interactively.
+        data_root:   Root directory containing ``AANNN`` data subfolders.
+        save_dir:    Directory to write output files.  Created automatically if
+                     it does not exist.  If ``None``, figures are shown
+                     interactively and no STL files are written.
+        sensor_z_mm: Distance from the sensor origin to the floor in mm.
+                     Used to compute the physical size of the STL grid via
+                     ``diagonal = 1.2741 × (sensor_z_mm − platform_h_mm)``.
+                     Defaults to 330 mm.
 
     Returns:
         Dict of ``{folder_id: {zone_index: mean_distance_mm}}`` for every
@@ -613,7 +826,7 @@ def analyse_measured_distances(
             continue
 
         try:
-            _letter_code, _distance = parse_folder_name(entry.name)
+            _letter_code, platform_h = parse_folder_name(entry.name)
         except ValueError as exc:
             print(f"Skipping {entry.name!r}: {exc}")
             skipped.append(entry.name)
@@ -641,6 +854,15 @@ def analyse_measured_distances(
             output_path=actual_save_dir,
         )
 
+        if actual_save_dir is not None:
+            export_stl(
+                folder_id=entry.name,
+                zone_heights=zone_heights,
+                platform_h_mm=float(platform_h),
+                sensor_z_mm=sensor_z_mm,
+                output_path=actual_save_dir,
+            )
+
         results[entry.name] = zone_means
 
     if skipped:
@@ -653,6 +875,7 @@ def analyse_object_heights(
     data_root: str,
     origin: Optional[float] = None,
     save_dir: Optional[str] = None,
+    sensor_z_mm: float = 330.0,
 ) -> dict[str, dict[int, Optional[float]]]:
     """
     Backwards-compatible alias for :func:`analyse_measured_distances`.
@@ -661,15 +884,19 @@ def analyse_object_heights(
     raw measured distances are displayed instead of derived object heights.
 
     Args:
-        data_root: Root directory containing ``AANNN`` data subfolders.
-        origin:    Accepted for backwards compatibility; ignored.
-        save_dir:  Directory to write output PNG files.  If ``None``, figures
-                   are shown interactively.
+        data_root:   Root directory containing ``AANNN`` data subfolders.
+        origin:      Accepted for backwards compatibility; ignored.
+        save_dir:    Directory to write output PNG files.  If ``None``, figures
+                     are shown interactively.
+        sensor_z_mm: Sensor origin height in mm; forwarded to
+                     :func:`analyse_measured_distances`.
 
     Returns:
         Dict of ``{folder_id: {zone_index: mean_distance_mm}}``.
     """
-    return analyse_measured_distances(data_root=data_root, save_dir=save_dir)
+    return analyse_measured_distances(
+        data_root=data_root, save_dir=save_dir, sensor_z_mm=sensor_z_mm
+    )
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -679,8 +906,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Visualise per-zone mean measured distances from ToF sensor data "
             "organised in AANNN subfolders.  Produces a tiled 2×2 heatmap "
-            "(8×8, 4×4, 2×2, rings) per folder, showing calibrated/cleaned "
-            "distances for valid readings only."
+            "(8×8, 4×4, 2×2, rings) per folder, an orbitable interactive HTML "
+            "3-D surface, and an STL mesh scaled to the sensor field-of-view."
         )
     )
     p.add_argument(
@@ -701,8 +928,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help=(
-            "Directory to save output heatmap PNGs.  "
-            "If omitted, figures are shown interactively."
+            "Directory to save output files (PNG, HTML, STL).  "
+            "If omitted, the matplotlib figure is shown interactively."
+        ),
+    )
+    p.add_argument(
+        "--sensor-z",
+        type=float,
+        default=330.0,
+        metavar="MM",
+        help=(
+            "Sensor origin height above the floor in mm.  Used to compute the "
+            "physical grid size for the STL export via "
+            "diagonal = 1.2741 × (sensor-z − platform_h).  Default: 330."
         ),
     )
     return p
@@ -713,4 +951,5 @@ if __name__ == "__main__":
     analyse_measured_distances(
         data_root=_args.data_root,
         save_dir=_args.save_dir,
+        sensor_z_mm=_args.sensor_z,
     )
