@@ -1,13 +1,12 @@
 """
-object_height.py – Calibrated object-height analysis using ToF sensor data.
+object_height.py – Measured-distance analysis using ToF sensor data.
 
 Data organisation
 -----------------
 Each sub-folder of ``data_root`` must be named ``AANNN``, where:
 
 * ``AA``  – one or more letters (test / position identifier).
-* ``NNN`` – one or more digits representing the **platform distance from the
-  sensor** in the same units as the ToF distance measurements (mm).
+* ``NNN`` – one or more digits (e.g. a reference distance in mm).
 
 Computation
 -----------
@@ -16,28 +15,24 @@ For each ``AANNN`` folder the script:
 1. Reads the ``data*.csv`` file and extracts per-zone ``distance_mm`` and
    ``is_valid_range`` columns.
 2. Computes the **mean measured distance** for each zone using valid readings
-   only.
-3. Computes the **object height above the platform**::
+   only (``is_valid_range == 1``).
 
-       object_height = platform_distance − calibrated_distance
+Visualisation
+-------------
+Produces a tiled 2×2 figure per folder that exactly matches the layout of
+``plot_error_heatmaps`` in ``Visualize.py``:
 
-   where ``calibrated_distance`` is the per-zone mean measured distance.
-   A *positive* value means the object surface is *closer* to the sensor
-   than the empty platform, i.e. the object protrudes toward the sensor.
-
-Sign convention note
-~~~~~~~~~~~~~~~~~~~~
-``origin`` is accepted for documentation / cross-check purposes and is used
-to validate that the caller's reference frame is consistent.  The active
-computation only needs ``platform_distance`` (from the folder name) and the
-raw ToF readings.
+* Top-left  : 8×8 individual zone heatmap.
+* Top-right : 4×4 aggregated groups.
+* Bottom-left : 2×2 aggregated groups.
+* Bottom-right : Ring aggregations.
 
 Usage
 -----
 ::
 
-    python object_height.py --data-root /path/to/data --origin 330
-    python object_height.py --data-root /path/to/data --origin 330 \\
+    python object_height.py --data-root /path/to/data
+    python object_height.py --data-root /path/to/data \\
                             --save-dir /path/to/output
 """
 
@@ -48,7 +43,6 @@ import os
 import re
 from typing import Optional
 
-import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -171,145 +165,255 @@ def compute_zone_valid_means(zone_data: dict) -> dict[int, Optional[float]]:
     return means
 
 
-# ── Object height computation ─────────────────────────────────────────────────
+# ── Heatmap plotting helpers ──────────────────────────────────────────────────
 
-def compute_object_heights(
-    zone_means: dict[int, Optional[float]],
-    platform_distance: int,
-) -> dict[int, Optional[float]]:
-    """
-    Compute the per-zone object height above the platform.
-
-    **Sign convention** – the sensor points *downward* toward the platform::
-
-        object_height = platform_distance − calibrated_distance
-
-    * Positive  → object surface is *closer* to the sensor than the platform
-      (object is sitting on the platform and protrudes toward the sensor).
-    * Zero      → zone reads exactly at platform level (no object).
-    * Negative  → zone reads *beyond* the platform (sensor sees past edge of
-      platform, or erroneous reading).
-
-    Args:
-        zone_means:        Dict of ``zone_index -> mean measured distance (mm)``
-                           as returned by :func:`compute_zone_valid_means`.
-        platform_distance: Sensor-to-platform distance in mm (from folder name).
-
-    Returns:
-        Dict of ``zone_index -> object height above platform (mm)``, with
-        ``None`` for zones that had no valid readings.
-    """
-    heights: dict[int, Optional[float]] = {}
-    for z in range(64):
-        mean = zone_means.get(z)
-        if mean is not None:
-            heights[z] = float(platform_distance - mean)
-        else:
-            heights[z] = None
-    return heights
+def _color_for_value(
+    value: float,
+    vmin: float,
+    vmax: float,
+    colormap,
+) -> tuple:
+    """Return an RGBA tuple from *colormap* mapped over [*vmin*, *vmax*]."""
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    return colormap(norm(value))
 
 
-# ── Heatmap plotting ──────────────────────────────────────────────────────────
-
-def plot_object_height_heatmap(
-    folder_id: str,
-    platform_distance: int,
-    object_heights: dict[int, Optional[float]],
-    output_path: Optional[str] = None,
+def _draw_distance_heatmap(
+    ax,
+    zone_values: dict,
+    grid_shape: tuple,
+    zone_labels: list,
+    cell_values: list,
+    vmin: float,
+    vmax: float,
+    colormap,
 ) -> None:
     """
-    Plot an 8×8 heatmap of per-zone object heights above the platform.
+    Draw a heatmap panel using ``FancyBboxPatch`` cells, matching the visual
+    style of ``draw_error_heatmap`` in ``Visualize.py``.
 
-    Layout mirrors the existing ``draw_heatmap`` / ``plot_error_heatmaps``
-    style (``FancyBboxPatch`` cells, white grid lines, zone labels inside
-    cells), but uses a continuous ``viridis`` colormap and a colorbar instead
-    of the categorical error colouring.
-
-    Zone numbering orientation:
-    * Z0  → bottom-left  (row 0, col 0 in matplotlib data coordinates).
-    * Z63 → top-right    (row 7, col 7).
+    Cell colour encodes the measured distance via *colormap*.
+    Cell text shows the label and the numeric value.
 
     Args:
-        folder_id:         Folder identifier string (e.g. ``"ob150"``).
-        platform_distance: Sensor-to-platform distance in mm.
-        object_heights:    Dict of ``zone_index -> object height (mm)`` or
-                           ``None``.
-        output_path:       If provided, save the figure as
-                           ``{output_path}/{folder_id}_ObjectHeight.png`` and
-                           close it.  If ``None``, display interactively.
+        ax:           Matplotlib axes to draw on.
+        zone_values:  Dict of ``cell_index -> value`` (may contain ``None``).
+        grid_shape:   ``(rows, cols)`` of the grid.
+        zone_labels:  Label string for each cell (same order as flattened grid).
+        cell_values:  Value for each cell (same order); ``None`` = no data.
+        vmin, vmax:   Colour scale limits.
+        colormap:     Matplotlib colormap instance.
     """
-    ROWS, COLS = 8, 8
+    rows, cols = grid_shape
 
-    # Normalise colormap across valid height values
-    valid_heights = [h for h in object_heights.values() if h is not None]
-    if valid_heights:
-        vmin = min(valid_heights)
-        vmax = max(valid_heights)
-    else:
-        vmin, vmax = 0.0, 1.0
+    for i, (label, val) in enumerate(zip(zone_labels, cell_values)):
+        r = i // cols
+        c = i % cols
 
-    # Avoid degenerate range (all cells identical)
-    if abs(vmax - vmin) < 1e-6:
-        vmin -= 1.0
-        vmax += 1.0
-
-    colormap = plt.cm.viridis  # type: ignore[attr-defined]
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
-    fig, ax = plt.subplots(figsize=(9, 9))
-    fig.suptitle(
-        f"Object Height Heatmap — {folder_id}\n"
-        f"Platform distance: {platform_distance} mm  |  "
-        f"height = platform_distance − measured_distance",
-        fontsize=12,
-        y=1.01,
-    )
-
-    for z in range(64):
-        r = z // COLS  # physical row (0 = bottom in matplotlib data coords)
-        c = z % COLS
-        h = object_heights.get(z)
-
-        if h is not None:
-            rgba = colormap(norm(h))
+        if val is not None:
+            color = _color_for_value(val, vmin, vmax, colormap)
         else:
-            rgba = (0.85, 0.85, 0.85, 1.0)  # light grey for missing data
+            color = (0.85, 0.85, 0.85, 1.0)
 
         rect = mpatches.FancyBboxPatch(
             (c, r), 1, 1,
             boxstyle="square,pad=0",
-            facecolor=rgba,
+            facecolor=color,
+            edgecolor="white",
+            linewidth=0.5,
+            transform=ax.transData,
+        )
+        ax.add_patch(rect)
+
+        val_text = f"{val:.1f}" if val is not None else "N/A"
+        ax.text(
+            c + 0.5, r + 0.5,
+            f"{label}\n{val_text}",
+            ha="center", va="center",
+            fontsize=5.5, color="white", fontweight="bold",
+        )
+
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, rows)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+
+
+def plot_measured_distance_heatmaps(
+    folder_id: str,
+    zone_means: dict[int, Optional[float]],
+    output_path: Optional[str] = None,
+) -> None:
+    """
+    Plot a tiled 2×2 figure of per-zone mean measured distances, matching the
+    multi-panel layout of ``plot_error_heatmaps`` in ``Visualize.py``.
+
+    Panels:
+    * Top-left     – 8×8 individual zone heatmap.
+    * Top-right    – 4×4 aggregated groups.
+    * Bottom-left  – 2×2 aggregated groups.
+    * Bottom-right – Ring aggregations.
+
+    Colour encodes the mean measured distance using the ``viridis`` colormap
+    across a shared scale derived from the valid zone values.
+
+    Args:
+        folder_id:    Folder identifier string (e.g. ``"ob150"``).
+        zone_means:   Dict of ``zone_index -> mean measured distance (mm)``
+                      as returned by :func:`compute_zone_valid_means`.
+        output_path:  If provided, save the figure as
+                      ``{output_path}/{folder_id}_MeasuredDistance.png`` and
+                      close it.  If ``None``, display interactively.
+    """
+    def get_ring(z: int) -> int:
+        r = z // 8
+        c = z % 8
+        return min(r, 7 - r, c, 7 - c)
+
+    colormap = plt.cm.viridis  # type: ignore[attr-defined]
+
+    # Shared colour scale across all valid zone values
+    valid_vals = [v for v in zone_means.values() if v is not None]
+    vmin = min(valid_vals) if valid_vals else 0.0
+    vmax = max(valid_vals) if valid_vals else 1.0
+    if abs(vmax - vmin) < 1e-6:
+        vmin -= 1.0
+        vmax += 1.0
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 16))
+    fig.suptitle(
+        f"Measured Distance Heatmaps — {folder_id}\n"
+        "(text = mean measured distance mm, colour = distance)",
+        fontsize=14,
+        y=1.002,
+    )
+
+    # ── Top-left: 8×8 zones ───────────────────────────────────────────────────
+    ax = axes[0][0]
+    ax.set_title("8×8 Zone Mean Distance (mm)", fontsize=10)
+    labels_8 = [f"Z{z}" for z in range(64)]
+    cell_8   = [zone_means.get(z) for z in range(64)]
+    _draw_distance_heatmap(ax, zone_means, (8, 8), labels_8, cell_8, vmin, vmax, colormap)
+
+    # ── Top-right: 4×4 aggregated groups ─────────────────────────────────────
+    ax = axes[0][1]
+    ax.set_title("4×4 Group Mean Distance (mm)", fontsize=10)
+    group_vals_4x4: dict[int, Optional[float]] = {}
+    labels_4x4: list[str] = []
+    cell_4x4:   list[Optional[float]] = []
+
+    for sg in range(16):
+        sr = sg // 4
+        sc = sg % 4
+        vals: list[float] = []
+        for dr in range(2):
+            for dc in range(2):
+                z = (sr * 2 + dr) * 8 + (sc * 2 + dc)
+                val_z = zone_means.get(z)
+                if val_z is not None:
+                    vals.append(val_z)
+        group_vals_4x4[sg] = float(np.mean(vals)) if vals else None
+        labels_4x4.append(f"G{sg}")
+        cell_4x4.append(group_vals_4x4[sg])
+
+    _draw_distance_heatmap(ax, group_vals_4x4, (4, 4), labels_4x4, cell_4x4, vmin, vmax, colormap)
+
+    # ── Bottom-left: 2×2 aggregated groups ───────────────────────────────────
+    ax = axes[1][0]
+    ax.set_title("2×2 Group Mean Distance (mm)", fontsize=10)
+    group_vals_2x2: dict[int, Optional[float]] = {}
+    labels_2x2: list[str] = []
+    cell_2x2:   list[Optional[float]] = []
+
+    for sg in range(4):
+        sr = sg // 2
+        sc = sg % 2
+        vals = []
+        for dr in range(4):
+            for dc in range(4):
+                z = (sr * 4 + dr) * 8 + (sc * 4 + dc)
+                val_z = zone_means.get(z)
+                if val_z is not None:
+                    vals.append(val_z)
+        group_vals_2x2[sg] = float(np.mean(vals)) if vals else None
+        labels_2x2.append(f"G{sg}")
+        cell_2x2.append(group_vals_2x2[sg])
+
+    _draw_distance_heatmap(ax, group_vals_2x2, (2, 2), labels_2x2, cell_2x2, vmin, vmax, colormap)
+
+    # ── Bottom-right: Ring aggregations ──────────────────────────────────────
+    ax = axes[1][1]
+    ax.set_title("Ring Mean Distance (mm)", fontsize=10)
+
+    ring_vals_all: dict[int, list[float]] = {0: [], 1: [], 2: [], 3: []}
+    for z in range(64):
+        ring = get_ring(z)
+        val_z = zone_means.get(z)
+        if val_z is not None:
+            ring_vals_all[ring].append(val_z)
+
+    ring_means: dict[int, Optional[float]] = {
+        r: (float(np.mean(v)) if v else None)
+        for r, v in ring_vals_all.items()
+    }
+
+    for z in range(64):
+        r    = z // 8
+        c    = z % 8
+        ring = get_ring(z)
+        val  = ring_means.get(ring)
+
+        color = (
+            _color_for_value(val, vmin, vmax, colormap)
+            if val is not None
+            else (0.85, 0.85, 0.85, 1.0)
+        )
+
+        rect = mpatches.FancyBboxPatch(
+            (c, r), 1, 1,
+            boxstyle="square,pad=0",
+            facecolor=color,
             edgecolor="white",
             linewidth=0.5,
         )
         ax.add_patch(rect)
 
-        text_val = f"{h:.1f}" if h is not None else "N/A"
-        ax.text(
-            c + 0.5, r + 0.5,
-            f"Z{z}\n{text_val}",
-            ha="center", va="center",
-            fontsize=6, color="white", fontweight="bold",
+        # Label each ring once at its top-left cell
+        if (c == ring) and (r == (7 - ring)):
+            val_text = f"{val:.1f}" if val is not None else "N/A"
+            ax.text(
+                c + 0.5, r + 0.5,
+                f"R{ring}\n{val_text}",
+                ha="center", va="center",
+                fontsize=7, color="white", fontweight="bold",
+            )
+
+    # Ring boundary lines
+    for ring in range(1, 4):
+        o = ring
+        ax.plot(
+            [o, 8 - o, 8 - o, o, o],
+            [o, o, 8 - o, 8 - o, o],
+            color="white", linewidth=1.5, linestyle="--",
         )
 
-    ax.set_xlim(0, COLS)
-    ax.set_ylim(0, ROWS)
+    ax.set_xlim(0, 8)
+    ax.set_ylim(0, 8)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal")
-    ax.set_xlabel("Column (zone % 8)", fontsize=9)
-    ax.set_ylabel("Row (zone // 8)", fontsize=9)
 
-    # Colorbar
-    sm = cm.ScalarMappable(cmap=colormap, norm=norm)
+    fig.subplots_adjust(right=0.88, top=0.94, hspace=0.25, wspace=0.15)
+
+    # Shared colorbar on the right edge
+    cbar_ax = fig.add_axes([0.91, 0.1, 0.02, 0.75])
+    sm = plt.cm.ScalarMappable(cmap=colormap, norm=mcolors.Normalize(vmin=vmin, vmax=vmax))
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Object height above platform (mm)", fontsize=9)
-
-    plt.tight_layout()
+    fig.colorbar(sm, cax=cbar_ax, label="Mean measured distance (mm)")
 
     if output_path is not None:
-        save_path = os.path.join(output_path, f"{folder_id}_ObjectHeight.png")
+        save_path = os.path.join(output_path, f"{folder_id}_MeasuredDistance.png")
         plt.savefig(save_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"Saved: {save_path}")
@@ -319,14 +423,13 @@ def plot_object_height_heatmap(
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
-def analyse_object_heights(
+def analyse_measured_distances(
     data_root: str,
-    origin: float,
     save_dir: Optional[str] = None,
 ) -> dict[str, dict[int, Optional[float]]]:
     """
-    Discover ``AANNN`` subfolders in ``data_root``, compute per-zone object
-    heights, and produce a heatmap for each folder.
+    Discover ``AANNN`` subfolders in ``data_root``, compute per-zone mean
+    measured distances, and produce a multi-panel heatmap for each folder.
 
     Folder discovery
     ~~~~~~~~~~~~~~~~
@@ -336,15 +439,12 @@ def analyse_object_heights(
 
     Args:
         data_root: Root directory containing ``AANNN`` data subfolders.
-        origin:    Sensor-origin reference distance (mm).  Stored for
-                   documentation / cross-check; the actual height computation
-                   uses ``platform_distance`` extracted from each folder name.
-        save_dir:  Directory to write output ``*_ObjectHeight.png`` files.
+        save_dir:  Directory to write output ``*_MeasuredDistance.png`` files.
                    Created automatically if it does not exist.  If ``None``,
                    figures are shown interactively.
 
     Returns:
-        Dict of ``{folder_id: {zone_index: object_height_mm}}`` for every
+        Dict of ``{folder_id: {zone_index: mean_distance_mm}}`` for every
         successfully processed folder.
 
     Raises:
@@ -364,16 +464,13 @@ def analyse_object_heights(
             continue
 
         try:
-            _letter_code, platform_distance = parse_folder_name(entry.name)
+            _letter_code, _distance = parse_folder_name(entry.name)
         except ValueError as exc:
             print(f"Skipping {entry.name!r}: {exc}")
             skipped.append(entry.name)
             continue
 
-        print(
-            f"Processing {entry.name!r}  "
-            f"(platform distance = {platform_distance} mm, origin = {origin} mm)"
-        )
+        print(f"Processing {entry.name!r}")
 
         zone_data = _load_zone_data_from_folder(entry.path)
         if zone_data is None:
@@ -381,16 +478,14 @@ def analyse_object_heights(
             continue
 
         zone_means = compute_zone_valid_means(zone_data)
-        heights = compute_object_heights(zone_means, platform_distance)
 
-        plot_object_height_heatmap(
+        plot_measured_distance_heatmaps(
             folder_id=entry.name,
-            platform_distance=platform_distance,
-            object_heights=heights,
+            zone_means=zone_means,
             output_path=save_dir,
         )
 
-        results[entry.name] = heights
+        results[entry.name] = zone_means
 
     if skipped:
         print(f"\nSkipped folders: {skipped}")
@@ -398,13 +493,38 @@ def analyse_object_heights(
     return results
 
 
+def analyse_object_heights(
+    data_root: str,
+    origin: Optional[float] = None,
+    save_dir: Optional[str] = None,
+) -> dict[str, dict[int, Optional[float]]]:
+    """
+    Backwards-compatible alias for :func:`analyse_measured_distances`.
+
+    The *origin* parameter is accepted but no longer used in the computation;
+    raw measured distances are displayed instead of derived object heights.
+
+    Args:
+        data_root: Root directory containing ``AANNN`` data subfolders.
+        origin:    Accepted for backwards compatibility; ignored.
+        save_dir:  Directory to write output PNG files.  If ``None``, figures
+                   are shown interactively.
+
+    Returns:
+        Dict of ``{folder_id: {zone_index: mean_distance_mm}}``.
+    """
+    return analyse_measured_distances(data_root=data_root, save_dir=save_dir)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Compute and visualise per-zone object heights above a platform "
-            "from ToF sensor data organised in AANNN subfolders."
+            "Visualise per-zone mean measured distances from ToF sensor data "
+            "organised in AANNN subfolders.  Produces a tiled 2×2 heatmap "
+            "(8×8, 4×4, 2×2, rings) per folder, showing calibrated/cleaned "
+            "distances for valid readings only."
         )
     )
     p.add_argument(
@@ -416,9 +536,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--origin",
         type=float,
-        required=True,
+        default=None,
         metavar="MM",
-        help="Sensor-origin reference distance in mm.",
+        help="Accepted for backwards compatibility; not used in the computation.",
     )
     p.add_argument(
         "--save-dir",
@@ -434,8 +554,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     _args = _build_parser().parse_args()
-    analyse_object_heights(
+    analyse_measured_distances(
         data_root=_args.data_root,
-        origin=_args.origin,
         save_dir=_args.save_dir,
     )
