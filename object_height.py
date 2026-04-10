@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from datetime import datetime
 from typing import Optional
 
 import matplotlib.colors as mcolors
@@ -51,6 +52,27 @@ import pandas as pd
 
 # ── Folder name regex ─────────────────────────────────────────────────────────
 _FOLDER_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+# ── Output folder setup ───────────────────────────────────────────────────────
+
+def setup_output_folder(output_path: str) -> str:
+    """
+    Create a timestamped output subfolder inside *output_path*.
+
+    The subfolder is named ``2D heatmaps-{YYYYMMDD_HHMMSS}`` and is created
+    with ``exist_ok=False`` so each run always gets a unique directory.
+
+    Args:
+        output_path: Parent directory in which to create the subfolder.
+
+    Returns:
+        Full path to the newly created timestamped subfolder.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    full_path = os.path.join(output_path, f"2D heatmaps-{timestamp}")
+    os.makedirs(full_path, exist_ok=False)
+    return full_path
 
 
 # ── Folder name parsing ───────────────────────────────────────────────────────
@@ -453,8 +475,10 @@ def analyse_measured_distances(
     if not os.path.isdir(data_root):
         raise ValueError(f"data_root is not a directory: {data_root!r}")
 
+    actual_save_dir: Optional[str] = None
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
+        actual_save_dir = setup_output_folder(save_dir)
 
     results: dict[str, dict[int, Optional[float]]] = {}
     skipped: list[str] = []
@@ -482,7 +506,7 @@ def analyse_measured_distances(
         plot_measured_distance_heatmaps(
             folder_id=entry.name,
             zone_means=zone_means,
-            output_path=save_dir,
+            output_path=actual_save_dir,
         )
 
         results[entry.name] = zone_means
