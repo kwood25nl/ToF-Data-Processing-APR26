@@ -1,66 +1,51 @@
-import argparse
-import numpy as np
 import trimesh
+import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 import os
-import csv
-from shapely.geometry import Polygon
 
-# Requirements:
-# trimesh
-# matplotlib
-# shapely
-
-def load_mesh(file_path):
+# Function to load STL files
+def load_stl(file_path):
     return trimesh.load(file_path)
 
-def create_static_preview(experiment_mesh, true_mesh):
-    fig, axs = plt.subplots(2, 3, figsize=(15, 10))
-    # Mid-plane cross-section for experiment
-    for i, plane in enumerate(['xy', 'xz', 'yz']):
-        section = experiment_mesh.section(plane='mid', plane_normal=[1, 0, 0], transform=None)
-        if section and hasattr(section, 'polygons'):  # Handle Path2D
-            for polygon in section.polygons:
-                L = plt.Line2D(*zip(*polygon), label='Experiment', color='blue')
-                axs[0, i].add_line(L)
-                axs[0, i].set_title(f'Experiment {plane}')
-                axs[0, i].set_xlabel(f'{plane} axis')
-                axs[0, i].set_ylabel('Height')
+# Function to render cross-sections
+def render_cross_sections(mesh, rotation_axis, starting_plane, num_slices, out_dir):
+    # Compute angles for slices
+    angles = np.linspace(0, 180, num_slices)
+    for angle in angles:
+        # Rotate mesh
+        mesh_copy = mesh.copy()
+        mesh_copy.apply_transform(trimesh.transformations.rotation_matrix(np.radians(angle), rotation_axis))
+        slice = mesh_copy.section(plane=starting_plane)
+        # Extract 2D polylines
+        contours = slice.to_polygons()
+        # Plot and save
+        plt.figure()
+        for contour in contours:
+            plt.plot(contour[:, 0], contour[:, 1])
+        plt.title(f'Slice at {angle} degrees')
+        plt.savefig(os.path.join(out_dir, f'slice_{angle}.png'))
+        plt.close()
 
-        section_true = true_mesh.section(plane='mid', plane_normal=[1, 0, 0], transform=None)
-        if section_true and hasattr(section_true, 'polygons'):
-            for polygon in section_true.polygons:
-                L = plt.Line2D(*zip(*polygon), label='True', color='red')
-                axs[1, i].add_line(L)
-                axs[1, i].set_title(f'True {plane}')
-                axs[1, i].set_xlabel(f'{plane} axis')
-                axs[1, i].set_ylabel('Height')
+# Main function
+def main(experiment_stl_path, true_stl_path, out_dir):
+    experiment_mesh = load_stl(experiment_stl_path)
+    true_mesh = load_stl(true_stl_path)
+    # Prompt for rotation axes and other parameters
+    exp_rotation_axis = np.array([1,0,0])  # Example axis for rotation
+    true_rotation_axis = np.array([0,1,0])  # Example axis for true mesh
+    starting_plane = 'xy'  # Example starting plane
+    num_slices = 10  # Example number of slices
+    # Render cross-sections
+    render_cross_sections(experiment_mesh, exp_rotation_axis, starting_plane, num_slices, out_dir)
+    # Additional processing for true mesh
+    true_slice = true_mesh.section(plane=starting_plane)
+    # Save true slice as PNG
+    plt.figure()
+    plt.plot(true_slice[:, 0], true_slice[:, 1])
+    plt.title('True Slice')
+    plt.savefig(os.path.join(out_dir, f'true_slice.png'))
+    plt.close()
 
-    plt.tight_layout()
-    plt.savefig('static_preview.png')
-    plt.show()
-
-
-def main():
-    parser = argparse.ArgumentParser(description='STL Slice Overlap Tool')
-    parser.add_argument('--experiment-stl', type=str, help='Path to experiment STL file')
-    parser.add_argument('--true-stl', type=str, help='Path to true STL file')
-    parser.add_argument('--out-dir', type=str, default='outputs', help='Output directory')
-    args = parser.parse_args()
-
-    # Fallback if paths are not provided
-    if not args.experiment_stl:
-        args.experiment_stl = input('Enter experiment STL file path: ')
-    if not args.true_stl:
-        args.true_stl = input('Enter true STL file path: ')
-
-    experiment_mesh = load_mesh(args.experiment_stl)
-    true_mesh = load_mesh(args.true_stl)
-
-    # Create static preview
-    create_static_preview(experiment_mesh, true_mesh)
-
-    # Additional interactions and (slice computations omitted for brevity)...
-
-if __name__ == '__main__':
-    main()
+# Example usage
+# main('path_to_experiment.stl', 'path_to_true.stl', 'output_directory')
