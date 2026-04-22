@@ -321,6 +321,92 @@ def _attach_cursor(fig, all_lines: list) -> None:
     fig.canvas.mpl_connect("motion_notify_event", _on_motion)
 
 
+def _build_3plane_figure(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+) -> Tuple["plt.Figure", list]:
+    """
+    Build the 3-plane overlap figure and return ``(fig, all_lines)``.
+
+    Layout
+    ------
+    Left column  : XY plane, spanning both rows.
+    Right column : XZ (top row) and YZ (bottom row), repositioned after
+                   the initial draw so their combined vertical extent
+                   exactly matches the XY axes box.
+
+    A single shared legend is placed between the suptitle and the plots.
+    The caller is responsible for show / save / close.
+    """
+    origin = true_mesh.bounding_box.centroid
+
+    fig = plt.figure(figsize=(14, 8))
+    fig.suptitle(
+        "Outline overlap check (Cartesian mm) — slices through TRUE centroid",
+        fontsize=13,
+        y=0.97,
+    )
+
+    # Reserve the top ~10 % of the figure for the suptitle and legend.
+    gs = fig.add_gridspec(2, 2, top=0.87, bottom=0.07, left=0.08, right=0.95,
+                          hspace=0.06, wspace=0.30)
+
+    ax_xy = fig.add_subplot(gs[:, 0])   # spans both rows
+    ax_xz = fig.add_subplot(gs[0, 1])   # top-right
+    ax_yz = fig.add_subplot(gs[1, 1])   # bottom-right
+
+    all_lines: list = []
+
+    for ax, plane_key, title in zip(
+        [ax_xy, ax_xz, ax_yz], ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]
+    ):
+        normal = PLANE_NORMAL[plane_key]
+        xlab, ylab = PLANE_AXES_LABEL[plane_key]
+
+        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
+        true_3d = _section_3d_polylines(true_mesh, origin, normal)
+
+        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
+        true_2d = _project_3d_to_2d(true_3d, plane_key)
+
+        all_lines.extend(_plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true"))
+        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment"))
+
+        ax.set_title(title)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        _set_equal(ax)  # no per-axis legend
+
+    # Single shared legend between suptitle and the plots.
+    handles, labels = ax_xy.get_legend_handles_labels()
+    fig.legend(
+        handles, labels,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.93),
+        frameon=True,
+        fontsize=10,
+    )
+
+    # --- Align XZ / YZ vertical extents to match the XY axes box ---
+    # canvas.draw() causes apply_aspect() to run, which updates each
+    # axis's _position to the actual aspect-adjusted bounding box.
+    fig.canvas.draw()
+
+    pos_xy = ax_xy.get_position()   # actual rendered position after aspect adjust
+    pos_xz = ax_xz.get_position()
+
+    x_r = pos_xz.x0
+    w_r = pos_xz.width
+    gap = 0.015   # small gap between XZ and YZ in figure-coordinate units
+    half_h = (pos_xy.height - gap) / 2.0
+
+    ax_xz.set_position([x_r, pos_xy.y0 + half_h + gap, w_r, half_h])
+    ax_yz.set_position([x_r, pos_xy.y0,               w_r, half_h])
+
+    return fig, all_lines
+
+
 def show_overlap_outlines_3planes(
     exp_mesh: trimesh.Trimesh,
     true_mesh: trimesh.Trimesh,
@@ -348,33 +434,7 @@ def show_overlap_outlines_3planes(
     str or None
         Path to the saved PNG if *save_png* is True, else None.
     """
-    origin = true_mesh.bounding_box.centroid
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
-
-    all_lines: list = []
-
-    for ax, plane_key, title in zip(axes, ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
-        normal = PLANE_NORMAL[plane_key]
-        xlab, ylab = PLANE_AXES_LABEL[plane_key]
-
-        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
-        true_3d = _section_3d_polylines(true_mesh, origin, normal)
-
-        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
-        true_2d = _project_3d_to_2d(true_3d, plane_key)
-
-        all_lines.extend(_plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true"))
-        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment"))
-
-        ax.set_title(title)
-        ax.set_xlabel(xlab)
-        ax.set_ylabel(ylab)
-        ax.legend(loc="best")
-        _set_equal(ax)
-
-    plt.tight_layout()
+    fig, all_lines = _build_3plane_figure(exp_mesh, true_mesh)
     _attach_cursor(fig, all_lines)
 
     out_path: Optional[str] = None
@@ -400,31 +460,7 @@ def save_overlap_outlines_3planes(
     Prefer *show_overlap_outlines_3planes* for interactive use.
     """
     out_dir = _ensure_dir(out_dir)
-    origin = true_mesh.bounding_box.centroid
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
-
-    for ax, plane_key, title in zip(axes, ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
-        normal = PLANE_NORMAL[plane_key]
-        xlab, ylab = PLANE_AXES_LABEL[plane_key]
-
-        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
-        true_3d = _section_3d_polylines(true_mesh, origin, normal)
-
-        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
-        true_2d = _project_3d_to_2d(true_3d, plane_key)
-
-        _plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true")
-        _plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment")
-
-        ax.set_title(title)
-        ax.set_xlabel(xlab)
-        ax.set_ylabel(ylab)
-        ax.legend(loc="best")
-        _set_equal(ax)
-
-    plt.tight_layout()
+    fig, _ = _build_3plane_figure(exp_mesh, true_mesh)
     out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
