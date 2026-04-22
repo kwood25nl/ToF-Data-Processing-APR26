@@ -117,7 +117,7 @@ def cluster_faces_by_normal(
     dot_threshold: float = 0.98,
 ) -> list[dict]:
     """
-    Greedy clustering of faces by similar normals.
+    Greedy clustering of faces by similar normals (no connectivity requirement).
 
     cluster dict:
       rep: representative normal
@@ -138,21 +138,87 @@ def cluster_faces_by_normal(
     return clusters
 
 
-def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
-    # 1) face normals + areas
+def cluster_faces_connected(
+    mesh: trimesh.Trimesh,
+    dot_threshold: float = 0.98,
+) -> list[dict]:
+    """
+    Cluster faces by similar normals AND spatial edge-connectivity.
+
+    Two faces belong to the same cluster only if they are connected through a
+    chain of edge-adjacent faces that all share a nearly parallel normal
+    (dot >= dot_threshold).  This finds the *largest exterior continuous
+    surface area* rather than the globally largest orientation group.
+
+    cluster dict:
+      rep:  area-weighted unit normal of the patch
+      idx:  list of face indices
+      area: total face area of the patch
+    """
+    from collections import defaultdict
+
     face_normals = np.asarray(mesh.face_normals, dtype=float)
     face_areas = np.asarray(mesh.area_faces, dtype=float)
+    n_faces = len(face_normals)
 
-    # 2) cluster by similar normals
-    clusters = cluster_faces_by_normal(face_normals, face_areas, dot_threshold=dot_threshold)
+    # 1) Assign each face to a normal group (greedy, by dot-product threshold)
+    group_reps: list[np.ndarray] = []
+    face_group = np.full(n_faces, -1, dtype=int)
+    for i, n in enumerate(face_normals):
+        for g_idx, rep in enumerate(group_reps):
+            if float(np.dot(n, rep)) >= dot_threshold:
+                face_group[i] = g_idx
+                break
+        if face_group[i] == -1:
+            face_group[i] = len(group_reps)
+            group_reps.append(n.copy())
 
-    # 3-4) largest area cluster
+    # 2) Union-Find: merge only adjacent faces that share the same normal group
+    parent = np.arange(n_faces, dtype=int)
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+
+    def _union(x: int, y: int) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for fi, fj in mesh.face_adjacency:  # (K, 2) pairs of edge-adjacent faces
+        if face_group[int(fi)] == face_group[int(fj)]:
+            _union(int(fi), int(fj))
+
+    # 3) Collect connected components into cluster dicts
+    comp: dict[int, list[int]] = defaultdict(list)
+    for i in range(n_faces):
+        comp[_find(i)].append(i)
+
+    clusters: list[dict] = []
+    for idx_list in comp.values():
+        idx_arr = np.array(idx_list, dtype=int)
+        n_vec = (face_normals[idx_arr] * face_areas[idx_arr, None]).sum(axis=0)
+        n_vec = _normalize(n_vec)
+        total_area = float(face_areas[idx_arr].sum())
+        clusters.append({"rep": n_vec, "idx": idx_list, "area": total_area})
+
+    return clusters
+
+
+def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
+    # 1) Cluster by similar normals AND spatial connectivity so the "largest
+    #    cluster" is the largest *contiguous* flat surface, not a collection of
+    #    scattered same-orientation faces on different sides of the mesh.
+    clusters = cluster_faces_connected(mesh, dot_threshold=dot_threshold)
+
+    # 2) Largest connected flat patch by area
     best = max(clusters, key=lambda c: c["area"])
     idx = best["idx"]
 
-    # 5) area-weighted avg normal
-    n = (face_normals[idx] * face_areas[idx, None]).sum(axis=0)
-    n = _normalize(n)
+    # 3) area-weighted avg normal (already stored in best["rep"])
+    n = best["rep"]
 
     return n, idx, clusters
 
