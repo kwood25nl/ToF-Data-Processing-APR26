@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Optional interactive cursor – install with:  pip install mplcursors
+# If not installed the script falls back to a plain matplotlib motion-event cursor.
+
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,6 +11,11 @@ from typing import List, Optional, Tuple
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
+
+try:
+    import mplcursors as _mplcursors
+except ImportError:
+    _mplcursors = None  # type: ignore[assignment]
 
 try:
     from shapely.geometry import Polygon
@@ -22,6 +30,17 @@ except Exception:
 # ----------------------------
 EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00004\sc144\outputs-20260421_135119_FOV55\sc144_3DHeatmap.stl"
 TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
+
+# ----------------------------
+# RUN-TIME FLAGS
+# Set these to True to enable the corresponding behaviour.
+# ----------------------------
+# Save aligned STL files to disk on every run.
+EXPORT_STL: bool = False
+# Save the overlap plot to a PNG file on every run.
+SAVE_PNG: bool = False
+# Pixel radius within which the fallback cursor snaps to the nearest data point.
+CURSOR_SNAP_THRESHOLD_PX: int = 20
 
 
 PLANE_NORMAL = {
@@ -207,16 +226,166 @@ def _project_3d_to_2d(polylines3d: List[np.ndarray], plane_key: str) -> List[np.
     return [pl[:, [i0, i1]] for pl in polylines3d]
 
 
-def _plot_polylines2d(ax, polylines2d: List[np.ndarray], color: str, lw: float = 1.5, label: Optional[str] = None):
+def _plot_polylines2d(ax, polylines2d: List[np.ndarray], color: str, lw: float = 1.5, label: Optional[str] = None) -> list:
+    """Plot 2-D polylines on *ax* and return the list of Line2D objects."""
+    lines = []
     first = True
     for pl in polylines2d:
         if pl.shape[0] < 2:
             continue
         if first and label is not None:
-            ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw, label=label)
+            (ln,) = ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw, label=label)
             first = False
         else:
-            ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw)
+            (ln,) = ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw)
+        lines.append(ln)
+    return lines
+
+
+def _attach_cursor(fig, all_lines: list) -> None:
+    """
+    Attach an interactive data cursor to *all_lines*.
+
+    Tries mplcursors first (pip install mplcursors).
+    Falls back to a lightweight matplotlib motion-event annotation.
+    """
+    if _mplcursors is not None:
+        cursor = _mplcursors.cursor(all_lines, hover=True)
+
+        @cursor.connect("add")
+        def _on_add(sel):
+            x, y = sel.target
+            sel.annotation.set_text(f"x={x:.3f}\ny={y:.3f}")
+            sel.annotation.get_bbox_patch().set(fc="lightyellow", alpha=0.85)
+
+        return  # mplcursors handles everything
+
+    # --- Fallback: plain matplotlib event-based cursor ---
+    axes_set = {ln.axes for ln in all_lines if ln.axes is not None}
+    annots: dict = {}
+    for ax in axes_set:
+        ann = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.85),
+            fontsize=8,
+            visible=False,
+        )
+        annots[ax] = ann
+
+    def _on_motion(event):
+        if event.inaxes is None:
+            for ann in annots.values():
+                if ann.get_visible():
+                    ann.set_visible(False)
+            fig.canvas.draw_idle()
+            return
+
+        ax = event.inaxes
+        ann = annots.get(ax)
+        if ann is None:
+            return
+
+        closest_dist = float("inf")
+        found_x = found_y = None
+        for ln in all_lines:
+            if ln.axes is not ax:
+                continue
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if len(xd) == 0:
+                continue
+            # distance in display coords
+            try:
+                pts_display = ax.transData.transform(np.column_stack([xd, yd]))
+                cursor_display = np.array([event.x, event.y])
+                dists = np.linalg.norm(pts_display - cursor_display, axis=1)
+                idx = int(np.argmin(dists))
+                d = float(dists[idx])
+                if d < closest_dist:
+                    closest_dist = d
+                    found_x, found_y = float(xd[idx]), float(yd[idx])
+            except (ValueError, TypeError):
+                pass
+
+        if found_x is not None and closest_dist < CURSOR_SNAP_THRESHOLD_PX:
+            ann.xy = (found_x, found_y)
+            ann.set_text(f"x={found_x:.3f}\ny={found_y:.3f}")
+            ann.set_visible(True)
+        else:
+            ann.set_visible(False)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("motion_notify_event", _on_motion)
+
+
+def show_overlap_outlines_3planes(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+    save_png: bool = False,
+    out_dir: str = "outputs",
+    filename_prefix: str = "overlap_check",
+) -> Optional[str]:
+    """
+    Slice both meshes along XY, XZ, YZ planes through TRUE centroid and overlay
+    outlines in an interactive matplotlib window.
+
+    Parameters
+    ----------
+    exp_mesh, true_mesh : trimesh.Trimesh
+        Aligned meshes to compare.
+    save_png : bool
+        When True the figure is also saved to *out_dir* as a timestamped PNG.
+    out_dir : str
+        Directory for the optional PNG output.
+    filename_prefix : str
+        Prefix for the PNG filename.
+
+    Returns
+    -------
+    str or None
+        Path to the saved PNG if *save_png* is True, else None.
+    """
+    origin = true_mesh.bounding_box.centroid
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
+
+    all_lines: list = []
+
+    for ax, plane_key, title in zip(axes, ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
+        normal = PLANE_NORMAL[plane_key]
+        xlab, ylab = PLANE_AXES_LABEL[plane_key]
+
+        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
+        true_3d = _section_3d_polylines(true_mesh, origin, normal)
+
+        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
+        true_2d = _project_3d_to_2d(true_3d, plane_key)
+
+        all_lines.extend(_plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true"))
+        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment"))
+
+        ax.set_title(title)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        ax.legend(loc="best")
+        _set_equal(ax)
+
+    plt.tight_layout()
+    _attach_cursor(fig, all_lines)
+
+    out_path: Optional[str] = None
+    if save_png:
+        _ensure_dir(out_dir)
+        out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
+        fig.savefig(out_path, dpi=200)
+        print("Wrote:", out_path)
+
+    plt.show()
+    return out_path
 
 
 def save_overlap_outlines_3planes(
@@ -226,8 +395,9 @@ def save_overlap_outlines_3planes(
     filename_prefix: str = "overlap_check",
 ) -> str:
     """
-    Slice both meshes along XY, XZ, YZ planes through TRUE centroid and overlay outlines.
-    Writes one 1x3 PNG.
+    Backwards-compatible wrapper: always saves a PNG and closes the figure.
+
+    Prefer *show_overlap_outlines_3planes* for interactive use.
     """
     out_dir = _ensure_dir(out_dir)
     origin = true_mesh.bounding_box.centroid
@@ -273,11 +443,18 @@ if __name__ == "__main__":
     true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
     exp_aligned, exp_info = align_mesh_bottom_to_xy(exp_mesh, dot_threshold=0.98, centroid_mode="bbox")
 
-    # Save sanity-check overlay outlines
-    out = save_overlap_outlines_3planes(exp_aligned, true_aligned, out_dir=out_dir, filename_prefix="aligned_overlap_3planes")
-    print("Wrote:", out)
+    # Show interactive overlap plot (optionally saves PNG when SAVE_PNG=True).
+    show_overlap_outlines_3planes(
+        exp_aligned,
+        true_aligned,
+        save_png=SAVE_PNG,
+        out_dir=out_dir,
+        filename_prefix="aligned_overlap_3planes",
+    )
 
-    # Optionally export aligned STLs
-    _ensure_dir(out_dir)
-    true_aligned.export(os.path.join(out_dir, f"true_aligned_{_ts()}.stl"))
-    exp_aligned.export(os.path.join(out_dir, f"experiment_aligned_{_ts()}.stl"))
+    # Export aligned STLs only when explicitly requested.
+    if EXPORT_STL:
+        _ensure_dir(out_dir)
+        true_aligned.export(os.path.join(out_dir, f"true_aligned_{_ts()}.stl"))
+        exp_aligned.export(os.path.join(out_dir, f"experiment_aligned_{_ts()}.stl"))
+        print("Exported aligned STL files to", out_dir)
