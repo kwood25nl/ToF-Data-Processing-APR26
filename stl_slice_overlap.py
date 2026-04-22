@@ -484,13 +484,20 @@ if __name__ == "__main__":
     out_dir = "outputs"
 
     true_mesh = trimesh.load(TRUE_STL_PATH, force="mesh")
-    if TRUE_STL_FLIP_180:
-        true_mesh.apply_transform(
-            trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
-        )
     exp_mesh = trimesh.load(EXPERIMENT_STL_PATH, force="mesh")
 
     true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
+
+    # Apply the 180° flip AFTER alignment so align_mesh_bottom_to_xy cannot undo it.
+    # Re-translate afterwards so the mesh still sits on the XY plane (min Z = 0).
+    if TRUE_STL_FLIP_180:
+        true_aligned.apply_transform(
+            trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
+        )
+        min_z = float(true_aligned.vertices[:, 2].min())
+        true_aligned.apply_transform(
+            trimesh.transformations.translation_matrix([0.0, 0.0, -min_z])
+        )
     exp_aligned, exp_info = align_mesh_bottom_to_xy(exp_mesh, dot_threshold=0.98, centroid_mode="bbox")
 
     # Show interactive overlap plot (optionally saves PNG when SAVE_PNG=True).
