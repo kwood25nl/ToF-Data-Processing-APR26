@@ -39,6 +39,9 @@ TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
 EXPORT_STL: bool = False
 # Save the overlap plot to a PNG file on every run.
 SAVE_PNG: bool = False
+# Rotate the true STL 180° about the X-axis before alignment (set True when the
+# raw file loads upside-down).
+TRUE_STL_FLIP_180: bool = False
 # Pixel radius within which the fallback cursor snaps to the nearest data point.
 CURSOR_SNAP_THRESHOLD_PX: int = 20
 
@@ -481,6 +484,10 @@ if __name__ == "__main__":
     out_dir = "outputs"
 
     true_mesh = trimesh.load(TRUE_STL_PATH, force="mesh")
+    if TRUE_STL_FLIP_180:
+        true_mesh.apply_transform(
+            trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
+        )
     exp_mesh = trimesh.load(EXPERIMENT_STL_PATH, force="mesh")
 
     true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
