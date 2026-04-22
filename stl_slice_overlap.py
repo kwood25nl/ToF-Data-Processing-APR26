@@ -1,51 +1,283 @@
-import trimesh
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
+from datetime import datetime
+from typing import List, Optional, Tuple
 
-# Function to load STL files
-def load_stl(file_path):
-    return trimesh.load(file_path)
+import numpy as np
+import trimesh
+import matplotlib.pyplot as plt
 
-# Function to render cross-sections
-def render_cross_sections(mesh, rotation_axis, starting_plane, num_slices, out_dir):
-    # Compute angles for slices
-    angles = np.linspace(0, 180, num_slices)
-    for angle in angles:
-        # Rotate mesh
-        mesh_copy = mesh.copy()
-        mesh_copy.apply_transform(trimesh.transformations.rotation_matrix(np.radians(angle), rotation_axis))
-        slice = mesh_copy.section(plane=starting_plane)
-        # Extract 2D polylines
-        contours = slice.to_polygons()
-        # Plot and save
-        plt.figure()
-        for contour in contours:
-            plt.plot(contour[:, 0], contour[:, 1])
-        plt.title(f'Slice at {angle} degrees')
-        plt.savefig(os.path.join(out_dir, f'slice_{angle}.png'))
-        plt.close()
+try:
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+except Exception:
+    Polygon = None
+    unary_union = None
 
-# Main function
-def main(experiment_stl_path, true_stl_path, out_dir):
-    experiment_mesh = load_stl(experiment_stl_path)
-    true_mesh = load_stl(true_stl_path)
-    # Prompt for rotation axes and other parameters
-    exp_rotation_axis = np.array([1,0,0])  # Example axis for rotation
-    true_rotation_axis = np.array([0,1,0])  # Example axis for true mesh
-    starting_plane = 'xy'  # Example starting plane
-    num_slices = 10  # Example number of slices
-    # Render cross-sections
-    render_cross_sections(experiment_mesh, exp_rotation_axis, starting_plane, num_slices, out_dir)
-    # Additional processing for true mesh
-    true_slice = true_mesh.section(plane=starting_plane)
-    # Save true slice as PNG
-    plt.figure()
-    plt.plot(true_slice[:, 0], true_slice[:, 1])
-    plt.title('True Slice')
-    plt.savefig(os.path.join(out_dir, f'true_slice.png'))
-    plt.close()
 
-# Example usage
-# main('path_to_experiment.stl', 'path_to_true.stl', 'output_directory')
+# ----------------------------
+# EDIT THESE PATHS
+# ----------------------------
+EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00004\sc144\outputs-20260421_135119_FOV55\sc144_3DHeatmap.stl"
+TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
+
+
+PLANE_NORMAL = {
+    "xy": np.array([0.0, 0.0, 1.0]),
+    "xz": np.array([0.0, 1.0, 0.0]),
+    "yz": np.array([1.0, 0.0, 0.0]),
+}
+
+PLANE_AXES_IDX = {
+    "xy": (0, 1),
+    "xz": (0, 2),
+    "yz": (1, 2),
+}
+
+PLANE_AXES_LABEL = {
+    "xy": ("X (mm)", "Y (mm)"),
+    "xz": ("X (mm)", "Z (mm)"),
+    "yz": ("Y (mm)", "Z (mm)"),
+}
+
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < eps:
+        return v * 0.0
+    return v / n
+
+
+def _set_equal(ax):
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _rotation_matrix_from_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    4x4 rotation matrix that rotates vector a onto vector b.
+    Handles parallel and anti-parallel cases.
+    """
+    a = _normalize(a)
+    b = _normalize(b)
+
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+
+    if dot > 1.0 - 1e-10:
+        return np.eye(4)
+
+    if dot < -1.0 + 1e-10:
+        candidate = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(candidate, a)) > 0.9:
+            candidate = np.array([0.0, 1.0, 0.0])
+        axis = _normalize(np.cross(a, candidate))
+        angle = np.pi
+        return trimesh.transformations.rotation_matrix(angle, axis)
+
+    axis = _normalize(np.cross(a, b))
+    angle = float(np.arccos(dot))
+    return trimesh.transformations.rotation_matrix(angle, axis)
+
+
+def cluster_faces_by_normal(
+    face_normals: np.ndarray,
+    face_areas: np.ndarray,
+    dot_threshold: float = 0.98,
+) -> list[dict]:
+    """
+    Greedy clustering of faces by similar normals.
+
+    cluster dict:
+      rep: representative normal
+      idx: face indices
+      area: summed face area
+    """
+    clusters: list[dict] = []
+    for i, n in enumerate(face_normals):
+        assigned = False
+        for c in clusters:
+            if float(np.dot(n, c["rep"])) >= dot_threshold:
+                c["idx"].append(i)
+                c["area"] += float(face_areas[i])
+                assigned = True
+                break
+        if not assigned:
+            clusters.append({"rep": n.copy(), "idx": [i], "area": float(face_areas[i])})
+    return clusters
+
+
+def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
+    # 1) face normals + areas
+    face_normals = np.asarray(mesh.face_normals, dtype=float)
+    face_areas = np.asarray(mesh.area_faces, dtype=float)
+
+    # 2) cluster by similar normals
+    clusters = cluster_faces_by_normal(face_normals, face_areas, dot_threshold=dot_threshold)
+
+    # 3-4) largest area cluster
+    best = max(clusters, key=lambda c: c["area"])
+    idx = best["idx"]
+
+    # 5) area-weighted avg normal
+    n = (face_normals[idx] * face_areas[idx, None]).sum(axis=0)
+    n = _normalize(n)
+
+    return n, idx, clusters
+
+
+def align_mesh_bottom_to_xy(
+    mesh: trimesh.Trimesh,
+    dot_threshold: float = 0.98,
+    centroid_mode: str = "bbox",  # "bbox" or "mean"
+) -> Tuple[trimesh.Trimesh, dict]:
+    """
+    1-10 as requested:
+      rotate bottom normal -> +Z
+      translate so minZ=0
+      center in XY
+    """
+    m = mesh.copy()
+
+    bottom_n, bottom_faces, clusters = detect_bottom_normal(m, dot_threshold=dot_threshold)
+
+    # 6-7) rotate to +Z
+    R = _rotation_matrix_from_vectors(bottom_n, np.array([0.0, 0.0, 1.0]))
+    m.apply_transform(R)
+
+    # 8) translate so lowest Z = 0
+    min_z = float(m.vertices[:, 2].min())
+    Tz = trimesh.transformations.translation_matrix([0.0, 0.0, -min_z])
+    m.apply_transform(Tz)
+
+    # 9) XY centroid
+    if centroid_mode == "bbox":
+        c = m.bounding_box.centroid
+        xy_center = np.array([c[0], c[1], 0.0], dtype=float)
+    elif centroid_mode == "mean":
+        c = m.vertices.mean(axis=0)
+        xy_center = np.array([c[0], c[1], 0.0], dtype=float)
+    else:
+        raise ValueError("centroid_mode must be 'bbox' or 'mean'")
+
+    # 10) translate so centroid at (0,0)
+    Txy = trimesh.transformations.translation_matrix([-xy_center[0], -xy_center[1], 0.0])
+    m.apply_transform(Txy)
+
+    info = {
+        "bottom_normal_original": bottom_n,
+        "bottom_faces_count": len(bottom_faces),
+        "clusters_count": len(clusters),
+        "largest_cluster_area": float(max(c["area"] for c in clusters)) if clusters else 0.0,
+        "min_z_after_rotation": min_z,
+        "xy_center_removed": xy_center,
+    }
+    return m, info
+
+
+# ----------------------------
+# Slicing + plotting check
+# ----------------------------
+def _section_3d_polylines(mesh: trimesh.Trimesh, origin_xyz: np.ndarray, normal_xyz: np.ndarray) -> List[np.ndarray]:
+    section = mesh.section(plane_origin=origin_xyz, plane_normal=normal_xyz)
+    if section is None:
+        return []
+    discrete = section.discrete
+    if callable(discrete):
+        discrete = discrete()
+    out = []
+    for seg in discrete:
+        arr = np.asarray(seg, dtype=float)
+        if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] >= 2:
+            out.append(arr)
+    return out
+
+
+def _project_3d_to_2d(polylines3d: List[np.ndarray], plane_key: str) -> List[np.ndarray]:
+    i0, i1 = PLANE_AXES_IDX[plane_key]
+    return [pl[:, [i0, i1]] for pl in polylines3d]
+
+
+def _plot_polylines2d(ax, polylines2d: List[np.ndarray], color: str, lw: float = 1.5, label: Optional[str] = None):
+    first = True
+    for pl in polylines2d:
+        if pl.shape[0] < 2:
+            continue
+        if first and label is not None:
+            ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw, label=label)
+            first = False
+        else:
+            ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw)
+
+
+def save_overlap_outlines_3planes(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+    out_dir: str,
+    filename_prefix: str = "overlap_check",
+) -> str:
+    """
+    Slice both meshes along XY, XZ, YZ planes through TRUE centroid and overlay outlines.
+    Writes one 1x3 PNG.
+    """
+    out_dir = _ensure_dir(out_dir)
+    origin = true_mesh.bounding_box.centroid
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
+
+    for ax, plane_key, title in zip(axes, ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
+        normal = PLANE_NORMAL[plane_key]
+        xlab, ylab = PLANE_AXES_LABEL[plane_key]
+
+        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
+        true_3d = _section_3d_polylines(true_mesh, origin, normal)
+
+        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
+        true_2d = _project_3d_to_2d(true_3d, plane_key)
+
+        _plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true")
+        _plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment")
+
+        ax.set_title(title)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        ax.legend(loc="best")
+        _set_equal(ax)
+
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+# ----------------------------
+# Example run
+# ----------------------------
+if __name__ == "__main__":
+    out_dir = "outputs"
+
+    true_mesh = trimesh.load(TRUE_STL_PATH, force="mesh")
+    exp_mesh = trimesh.load(EXPERIMENT_STL_PATH, force="mesh")
+
+    true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
+    exp_aligned, exp_info = align_mesh_bottom_to_xy(exp_mesh, dot_threshold=0.98, centroid_mode="bbox")
+
+    # Save sanity-check overlay outlines
+    out = save_overlap_outlines_3planes(exp_aligned, true_aligned, out_dir=out_dir, filename_prefix="aligned_overlap_3planes")
+    print("Wrote:", out)
+
+    # Optionally export aligned STLs
+    _ensure_dir(out_dir)
+    true_aligned.export(os.path.join(out_dir, f"true_aligned_{_ts()}.stl"))
+    exp_aligned.export(os.path.join(out_dir, f"experiment_aligned_{_ts()}.stl"))
