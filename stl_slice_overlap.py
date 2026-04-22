@@ -28,8 +28,8 @@ except Exception:
 # ----------------------------
 # EDIT THESE PATHS
 # ----------------------------
-EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00004\sc144\outputs-20260421_135119_FOV55\sc144_3DHeatmap.stl"
-TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
+EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\outputs_FOV55-20260422_163657\sc139_3DHeatmap.stl"
+TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\Comparitive STLs\04-00002.STL"
 
 # ----------------------------
 # RUN-TIME FLAGS
@@ -41,7 +41,7 @@ EXPORT_STL: bool = False
 SAVE_PNG: bool = False
 # Rotate the true STL 180° about the X-axis before alignment (set True when the
 # raw file loads upside-down).
-TRUE_STL_FLIP_180: bool = False
+TRUE_STL_FLIP_180: bool = True
 # Pixel radius within which the fallback cursor snaps to the nearest data point.
 CURSOR_SNAP_THRESHOLD_PX: int = 20
 
@@ -411,7 +411,8 @@ def _build_3plane_figure(
 
     fig = plt.figure(figsize=(14, 8))
     fig.suptitle(
-        "Outline overlap check (Cartesian mm) — slices through TRUE centroid",
+        "Cross-Sectional Comparison of Calibration Objects and ToF Measurements\n"
+        "Object: 04-00002   Distance: 15cm  FOV: 55°",
         fontsize=13,
         y=0.97,
     )
@@ -438,8 +439,8 @@ def _build_3plane_figure(
         exp_2d = _project_3d_to_2d(exp_3d, plane_key)
         true_2d = _project_3d_to_2d(true_3d, plane_key)
 
-        all_lines.extend(_plot_polylines2d(ax, true_2d, color="tab:orange", lw=2.0, label="true"))
-        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="tab:blue", lw=1.2, label="experiment"))
+        all_lines.extend(_plot_polylines2d(ax, true_2d, color="#18A5AA", lw=2.0, label="Actual"))
+        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="#E97122", lw=1.2, label="Measured"))
 
         ax.set_title(title)
         ax.set_xlabel(xlab)
@@ -452,7 +453,7 @@ def _build_3plane_figure(
         handles, labels,
         loc="upper center",
         ncol=2,
-        bbox_to_anchor=(0.5, 0.93),
+        bbox_to_anchor=(0.5, 0.9),
         frameon=True,
         fontsize=10,
     )
@@ -467,7 +468,7 @@ def _build_3plane_figure(
 
     x_r = pos_xz.x0
     w_r = pos_xz.width
-    gap = 0.0   # no gap between XZ and YZ
+    gap = 0.1   # no gap between XZ and YZ
     half_h = (pos_xy.height - gap) / 2.0
 
     ax_xz.set_position([x_r, pos_xy.y0 + half_h + gap, w_r, half_h])
