@@ -398,11 +398,18 @@ def _build_3plane_figure(
 
     x_r = pos_xz.x0
     w_r = pos_xz.width
-    gap = 0.015   # small gap between XZ and YZ in figure-coordinate units
+    gap = 0.0   # no gap between XZ and YZ
     half_h = (pos_xy.height - gap) / 2.0
 
     ax_xz.set_position([x_r, pos_xy.y0 + half_h + gap, w_r, half_h])
     ax_yz.set_position([x_r, pos_xy.y0,               w_r, half_h])
+
+    # Use adjustable="datalim" so the axes boxes hold their allocated height.
+    # With "box" (the default), matplotlib re-shrinks the box to match the
+    # data aspect ratio, which made the XZ/YZ panels stay short regardless
+    # of figsize or gap changes.
+    ax_xz.set_aspect("equal", adjustable="datalim")
+    ax_yz.set_aspect("equal", adjustable="datalim")
 
     return fig, all_lines
 
