@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -6,25 +7,13 @@ from typing import List, Optional, Tuple
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
-
-try:
-    import mplcursors as _mplcursors
-except ImportError:
-    _mplcursors = None  # type: ignore[assignment]
-
-try:
-    from shapely.geometry import Polygon
-    from shapely.ops import unary_union
-except Exception:
-    Polygon = None
-    unary_union = None
-
+import mplcursors as _mplcursors
 
 # ----------------------------
 # EDIT THESE PATHS
 # ----------------------------
-EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00004\sc144\outputs-20260421_135119_FOV55\sc144_3DHeatmap.stl"
-TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
+EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Correction Tests/OutputV1.stl"
+TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\Comparitive STLs\04-00002.STL"
 
 # ----------------------------
 # RUN-TIME FLAGS
@@ -34,6 +23,9 @@ TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\10cmCAL_pyd.STL"
 EXPORT_STL: bool = False
 # Save the overlap plot to a PNG file on every run.
 SAVE_PNG: bool = False
+# Rotate the true STL 180° about the X-axis before alignment (set True when the
+# raw file loads upside-down).
+TRUE_STL_FLIP_180: bool = False
 # Pixel radius within which the fallback cursor snaps to the nearest data point.
 CURSOR_SNAP_THRESHOLD_PX: int = 20
 
@@ -109,7 +101,7 @@ def cluster_faces_by_normal(
     dot_threshold: float = 0.98,
 ) -> list[dict]:
     """
-    Greedy clustering of faces by similar normals.
+    Greedy clustering of faces by similar normals (no connectivity requirement).
 
     cluster dict:
       rep: representative normal
@@ -130,21 +122,87 @@ def cluster_faces_by_normal(
     return clusters
 
 
-def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
-    # 1) face normals + areas
+def cluster_faces_connected(
+    mesh: trimesh.Trimesh,
+    dot_threshold: float = 0.98,
+) -> list[dict]:
+    """
+    Cluster faces by similar normals AND spatial edge-connectivity.
+
+    Two faces belong to the same cluster only if they are connected through a
+    chain of edge-adjacent faces that all share a nearly parallel normal
+    (dot >= dot_threshold).  This finds the *largest exterior continuous
+    surface area* rather than the globally largest orientation group.
+
+    cluster dict:
+      rep:  area-weighted unit normal of the patch
+      idx:  list of face indices
+      area: total face area of the patch
+    """
+    from collections import defaultdict
+
     face_normals = np.asarray(mesh.face_normals, dtype=float)
     face_areas = np.asarray(mesh.area_faces, dtype=float)
+    n_faces = len(face_normals)
 
-    # 2) cluster by similar normals
-    clusters = cluster_faces_by_normal(face_normals, face_areas, dot_threshold=dot_threshold)
+    # 1) Assign each face to a normal group (greedy, by dot-product threshold)
+    group_reps: list[np.ndarray] = []
+    face_group = np.full(n_faces, -1, dtype=int)
+    for i, n in enumerate(face_normals):
+        for g_idx, rep in enumerate(group_reps):
+            if float(np.dot(n, rep)) >= dot_threshold:
+                face_group[i] = g_idx
+                break
+        if face_group[i] == -1:
+            face_group[i] = len(group_reps)
+            group_reps.append(n.copy())
 
-    # 3-4) largest area cluster
+    # 2) Union-Find: merge only adjacent faces that share the same normal group
+    parent = np.arange(n_faces, dtype=int)
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+
+    def _union(x: int, y: int) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for fi, fj in mesh.face_adjacency:  # (K, 2) pairs of edge-adjacent faces
+        if face_group[int(fi)] == face_group[int(fj)]:
+            _union(int(fi), int(fj))
+
+    # 3) Collect connected components into cluster dicts
+    comp: dict[int, list[int]] = defaultdict(list)
+    for i in range(n_faces):
+        comp[_find(i)].append(i)
+
+    clusters: list[dict] = []
+    for idx_list in comp.values():
+        idx_arr = np.array(idx_list, dtype=int)
+        n_vec = (face_normals[idx_arr] * face_areas[idx_arr, None]).sum(axis=0)
+        n_vec = _normalize(n_vec)
+        total_area = float(face_areas[idx_arr].sum())
+        clusters.append({"rep": n_vec, "idx": idx_list, "area": total_area})
+
+    return clusters
+
+
+def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
+    # 1) Cluster by similar normals AND spatial connectivity so the "largest
+    #    cluster" is the largest *contiguous* flat surface, not a collection of
+    #    scattered same-orientation faces on different sides of the mesh.
+    clusters = cluster_faces_connected(mesh, dot_threshold=dot_threshold)
+
+    # 2) Largest connected flat patch by area
     best = max(clusters, key=lambda c: c["area"])
     idx = best["idx"]
 
-    # 5) area-weighted avg normal
-    n = (face_normals[idx] * face_areas[idx, None]).sum(axis=0)
-    n = _normalize(n)
+    # 3) area-weighted avg normal (already stored in best["rep"])
+    n = best["rep"]
 
     return n, idx, clusters
 
@@ -316,6 +374,100 @@ def _attach_cursor(fig, all_lines: list) -> None:
     fig.canvas.mpl_connect("motion_notify_event", _on_motion)
 
 
+def _build_3plane_figure(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+) -> Tuple["plt.Figure", list]:
+    """
+    Build the 3-plane overlap figure and return ``(fig, all_lines)``.
+
+    Layout
+    ------
+    Left column  : XY plane, spanning both rows.
+    Right column : XZ (top row) and YZ (bottom row), repositioned after
+                   the initial draw so their combined vertical extent
+                   exactly matches the XY axes box.
+
+    A single shared legend is placed between the suptitle and the plots.
+    The caller is responsible for show / save / close.
+    """
+    origin = true_mesh.bounding_box.centroid
+
+    fig = plt.figure(figsize=(14, 8))
+    fig.suptitle(
+        "Cross-Sectional Comparison of Calibration Objects and ToF Measurements\n"
+        "Object: 04-00002   Distance: 15cm  FOV: 55°",
+        fontsize=13,
+        y=0.97,
+    )
+
+    # Reserve the top ~10 % of the figure for the suptitle and legend.
+    gs = fig.add_gridspec(2, 2, top=0.87, bottom=0.07, left=0.08, right=0.95,
+                          hspace=0.06, wspace=0.30)
+
+    ax_xy = fig.add_subplot(gs[:, 0])   # spans both rows
+    ax_xz = fig.add_subplot(gs[0, 1])   # top-right
+    ax_yz = fig.add_subplot(gs[1, 1])   # bottom-right
+
+    all_lines: list = []
+
+    for ax, plane_key, title in zip(
+        [ax_xy, ax_xz, ax_yz], ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]
+    ):
+        normal = PLANE_NORMAL[plane_key]
+        xlab, ylab = PLANE_AXES_LABEL[plane_key]
+
+        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
+        true_3d = _section_3d_polylines(true_mesh, origin, normal)
+
+        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
+        true_2d = _project_3d_to_2d(true_3d, plane_key)
+
+        all_lines.extend(_plot_polylines2d(ax, true_2d, color="#18A5AA", lw=2.0, label="Actual"))
+        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="#E97122", lw=1.2, label="Measured"))
+
+        ax.set_title(title)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        _set_equal(ax)  # no per-axis legend
+
+    # Single shared legend between suptitle and the plots.
+    handles, labels = ax_xy.get_legend_handles_labels()
+    fig.legend(
+        handles, labels,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.9),
+        frameon=True,
+        fontsize=10,
+    )
+
+    # --- Align XZ / YZ vertical extents to match the XY axes box ---
+    # canvas.draw() causes apply_aspect() to run, which updates each
+    # axis's _position to the actual aspect-adjusted bounding box.
+    fig.canvas.draw()
+
+    pos_xy = ax_xy.get_position()   # actual rendered position after aspect adjust
+    pos_xz = ax_xz.get_position()
+
+    x_r = pos_xz.x0
+    w_r = pos_xz.width
+    gap = 0.1   # no gap between XZ and YZ
+    half_h = (pos_xy.height - gap) / 2.0
+
+    ax_xz.set_position([x_r, pos_xy.y0 + half_h + gap, w_r, half_h])
+    ax_yz.set_position([x_r, pos_xy.y0,               w_r, half_h])
+
+    # Use adjustable="datalim" so the axes boxes hold their allocated height.
+    # With "box" (the default), matplotlib re-shrinks the box to match the
+    # data aspect ratio, which made the XZ/YZ panels stay short regardless
+    # of figsize or gap changes.
+    ax_xz.set_aspect("equal", adjustable="datalim")
+    ax_yz.set_aspect("equal", adjustable="datalim")
+
+    return fig, all_lines
+
+
 def show_overlap_outlines_3planes(
     exp_mesh: trimesh.Trimesh,
     true_mesh: trimesh.Trimesh,
@@ -343,39 +495,7 @@ def show_overlap_outlines_3planes(
     str or None
         Path to the saved PNG if *save_png* is True, else None.
     """
-    origin = true_mesh.bounding_box.centroid
-
-    fig = plt.figure(figsize=(10, 10))
-    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
-    gs = fig.add_gridspec(2, 2)
-
-    ax_xy = fig.add_subplot(gs[:, 0])  # col 0, spans both rows
-    ax_xz = fig.add_subplot(gs[0, 1])  # col 1, row 0
-    ax_yz = fig.add_subplot(gs[1, 1])  # col 1, row 1
-
-
-    all_lines: list = []
-
-    for ax, plane_key, title in zip([ax_xy, ax_xz, ax_yz], ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
-        normal = PLANE_NORMAL[plane_key]
-        xlab, ylab = PLANE_AXES_LABEL[plane_key]
-
-        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
-        true_3d = _section_3d_polylines(true_mesh, origin, normal)
-
-        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
-        true_2d = _project_3d_to_2d(true_3d, plane_key)
-
-        all_lines.extend(_plot_polylines2d(ax, true_2d, color="#18A5AA", lw=2.0, label="Actual"))
-        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="#E97122", lw=1.2, label="Measured"))
-
-        ax.set_title(title)
-        ax.set_xlabel(xlab)
-        ax.set_ylabel(ylab)
-        ax.legend(loc="best")
-        _set_equal(ax)
-
-    plt.tight_layout()
+    fig, all_lines = _build_3plane_figure(exp_mesh, true_mesh)
     _attach_cursor(fig, all_lines)
 
     out_path: Optional[str] = None
@@ -401,31 +521,7 @@ def save_overlap_outlines_3planes(
     Prefer *show_overlap_outlines_3planes* for interactive use.
     """
     out_dir = _ensure_dir(out_dir)
-    origin = true_mesh.bounding_box.centroid
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Outline overlap check (Cartesian mm) — slices through TRUE centroid", fontsize=13)
-
-    for ax, plane_key, title in zip(axes, ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]):
-        normal = PLANE_NORMAL[plane_key]
-        xlab, ylab = PLANE_AXES_LABEL[plane_key]
-
-        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
-        true_3d = _section_3d_polylines(true_mesh, origin, normal)
-
-        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
-        true_2d = _project_3d_to_2d(true_3d, plane_key)
-
-        _plot_polylines2d(ax, true_2d, color="#18A5AA", lw=2.0, label="Actual")
-        _plot_polylines2d(ax, exp_2d, color="#E97122", lw=1.2, label="Measured")
-
-        ax.set_title(title)
-        ax.set_xlabel(xlab)
-        ax.set_ylabel(ylab)
-        ax.legend(loc="best")
-        _set_equal(ax)
-
-    plt.tight_layout()
+    fig, _ = _build_3plane_figure(exp_mesh, true_mesh)
     out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -442,6 +538,17 @@ if __name__ == "__main__":
     exp_mesh = trimesh.load(EXPERIMENT_STL_PATH, force="mesh")
 
     true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
+
+    # Apply the 180° flip AFTER alignment so align_mesh_bottom_to_xy cannot undo it.
+    # Re-translate afterwards so the mesh still sits on the XY plane (min Z = 0).
+    if TRUE_STL_FLIP_180:
+        true_aligned.apply_transform(
+            trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0])
+        )
+        min_z = float(true_aligned.vertices[:, 2].min())
+        true_aligned.apply_transform(
+            trimesh.transformations.translation_matrix([0.0, 0.0, -min_z])
+        )
     exp_aligned, exp_info = align_mesh_bottom_to_xy(exp_mesh, dot_threshold=0.98, centroid_mode="bbox")
 
     # Show interactive overlap plot (optionally saves PNG when SAVE_PNG=True).
@@ -452,3 +559,10 @@ if __name__ == "__main__":
         out_dir=out_dir,
         filename_prefix="aligned_overlap_3planes",
     )
+
+    # Export aligned STLs only when explicitly requested.
+    if EXPORT_STL:
+        _ensure_dir(out_dir)
+        true_aligned.export(os.path.join(out_dir, f"true_aligned_{_ts()}.stl"))
+        exp_aligned.export(os.path.join(out_dir, f"experiment_aligned_{_ts()}.stl"))
+        print("Exported aligned STL files to", out_dir)
