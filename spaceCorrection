@@ -44,8 +44,6 @@ FLOOR_EDGE_THRESHOLD = None   # Z-gradient magnitude to call an edge. None = aut
                                # edge is missed entirely.
 FLOOR_GRID_RES       = 128    # Resolution of the 2D grid used for edge detection.
                                # Higher = finer edges but slower. 64-256 is typical.
-INVERT_DETILT        = True  # If the detilt makes the tilt WORSE, set this to True.
-                               # Flips the floor normal before computing the rotation.
 
 
 # ─────────────────────────────────────────────
