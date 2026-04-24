@@ -1,343 +1,575 @@
-"""
-align_stl.py
-------------
-Aligns a 3D camera scan STL to a ToF (ground-truth) STL using:
-  1. Plane-fit tilt correction  — removes Z tilt between the two meshes
-  2. Z scale correction         — fixes depth scale using ToF Z as ground truth
-  3. ICP (coarse + fine)        — cleans up residual misalignment
+from __future__ import annotations
 
-Usage:
-  1) Paste your paths into the CONFIG section below
-  2) Run:
-        python align_stl.py
-"""
+import os
+from datetime import datetime
+from typing import List, Optional, Tuple
 
 import numpy as np
-import open3d as o3d
+import trimesh
+import matplotlib.pyplot as plt
+import mplcursors as _mplcursors
+
+# ----------------------------
+# EDIT THESE PATHS
+# ----------------------------
+EXPERIMENT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Correction Tests\Output_centerV1.stl"
+TRUE_STL_PATH = r"Z:\Kaitie\LiDAR\Calibration Objects\Comparitive STLs\04-00002.STL"
+
+# ----------------------------
+# RUN-TIME FLAGS
+# Set these to True to enable the corresponding behaviour.
+# ----------------------------
+# Save aligned STL files to disk on every run.
+EXPORT_STL: bool = False
+# Save the overlap plot to a PNG file on every run.
+SAVE_PNG: bool = False
+
+# Rotate meshes 180 about the X-axis AFTER alignment.
+# Set True when a file loads upside-down.
+TRUE_STL_FLIP_180: bool = True
+EXPERIMENT_STL_FLIP_180: bool = True
+
+# Pixel radius within which the fallback cursor snaps to the nearest data point.
+CURSOR_SNAP_THRESHOLD_PX: int = 20
 
 
-# ─────────────────────────────────────────────
-# CONFIG: paste your paths here
-# ─────────────────────────────────────────────
-TOF_STL_PATH    = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\outputs_FOV55-20260422_163657\sc139_3DHeatmap.stl"
-SCAN_STL_PATH   = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\shifted139_Output\20260413_164304\CorrectionV6.stl"
-OUTPUT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Correction Tests/OutputV1.stl"
+PLANE_NORMAL = {
+    "xy": np.array([0.0, 0.0, 1.0]),
+    "xz": np.array([0.0, 1.0, 0.0]),
+    "yz": np.array([1.0, 0.0, 0.0]),
+}
+
+PLANE_AXES_IDX = {
+    "xy": (0, 1),
+    "xz": (0, 2),
+    "yz": (1, 2),
+}
+
+PLANE_AXES_LABEL = {
+    "xy": ("X (mm)", "Y (mm)"),
+    "xz": ("X (mm)", "Z (mm)"),
+    "yz": ("Y (mm)", "Z (mm)"),
+}
 
 
-
-SAMPLES    = 50000
-VOXEL_SIZE = 1.0
-XY_RADIUS  = None   # Set to a float (e.g. 2.0) to manually cap XY match distance
-                    # for Z scale correction. None = auto (5% of ToF XY diagonal).
+def _ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# ─────────────────────────────────────────────
-# 1. LOAD STLs AS POINT CLOUDS
-# ─────────────────────────────────────────────
-
-def load_stl_as_pcd(path: str, samples: int = 50000) -> o3d.geometry.PointCloud:
-    """Load an STL file and uniformly sample it into a point cloud."""
-    mesh = o3d.io.read_triangle_mesh(path)
-    mesh.compute_vertex_normals()
-    pcd = mesh.sample_points_uniformly(number_of_points=samples)
-    return pcd
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
-def load_stl_mesh(path: str) -> o3d.geometry.TriangleMesh:
-    mesh = o3d.io.read_triangle_mesh(path)
-    mesh.compute_vertex_normals()
-    return mesh
+def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < eps:
+        return v * 0.0
+    return v / n
 
 
-# ─────────────────────────────────────────────
-# 2. PLANE-FIT TILT CORRECTION
-# ─────────────────────────────────────────────
+def _set_equal(ax):
+    ax.set_aspect("equal", adjustable="box")
 
-def fit_plane(points: np.ndarray, max_points: int = 300) -> np.ndarray:
+
+def _rotation_matrix_from_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
-    Fit a plane to 3D points via SVD. Returns unit normal.
-    Randomly subsamples to max_points before SVD — 300 pts is plenty for a
-    stable plane fit, and avoids the memory/CPU crash from running SVD on 50k pts.
+    4x4 rotation matrix that rotates vector a onto vector b.
+    Handles parallel and anti-parallel cases.
     """
-    if len(points) > max_points:
-        idx = np.random.choice(len(points), max_points, replace=False)
-        points = points[idx]
-    centroid = points.mean(axis=0)
-    _, _, Vt = np.linalg.svd(points - centroid)
-    normal = Vt[-1]  # last row = smallest singular value = normal
-    return normal / np.linalg.norm(normal)
+    a = _normalize(a)
+    b = _normalize(b)
+
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+
+    if dot > 1.0 - 1e-10:
+        return np.eye(4)
+
+    if dot < -1.0 + 1e-10:
+        candidate = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(candidate, a)) > 0.9:
+            candidate = np.array([0.0, 1.0, 0.0])
+        axis = _normalize(np.cross(a, candidate))
+        angle = np.pi
+        return trimesh.transformations.rotation_matrix(angle, axis)
+
+    axis = _normalize(np.cross(a, b))
+    angle = float(np.arccos(dot))
+    return trimesh.transformations.rotation_matrix(angle, axis)
 
 
-def rotation_between_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def cluster_faces_by_normal(
+    face_normals: np.ndarray,
+    face_areas: np.ndarray,
+    dot_threshold: float = 0.98,
+) -> list[dict]:
     """
-    Compute 3x3 rotation matrix that rotates unit vector a onto unit vector b.
-    Uses Rodrigues' formula.
+    Greedy clustering of faces by similar normals (no connectivity requirement).
+
+    cluster dict:
+      rep: representative normal
+      idx: face indices
+      area: summed face area
     """
-    a = a / np.linalg.norm(a)
-    b = b / np.linalg.norm(b)
-    v = np.cross(a, b)
-    c = np.dot(a, b)
-    if abs(c + 1.0) < 1e-6:
-        # Vectors are anti-parallel — rotate 180° about any perpendicular axis
-        perp = np.array([1, 0, 0]) if abs(a[0]) < 0.9 else np.array([0, 1, 0])
-        axis = np.cross(a, perp)
-        axis /= np.linalg.norm(axis)
-        return -np.eye(3) + 2 * np.outer(axis, axis)
-    s = np.linalg.norm(v)
-    kmat = np.array([[0, -v[2], v[1]],
-                     [v[2], 0, -v[0]],
-                     [-v[1], v[0], 0]])
-    R = np.eye(3) + kmat + kmat @ kmat * ((1 - c) / (s ** 2 + 1e-12))
-    return R
+    clusters: list[dict] = []
+    for i, n in enumerate(face_normals):
+        assigned = False
+        for c in clusters:
+            if float(np.dot(n, c["rep"])) >= dot_threshold:
+                c["idx"].append(i)
+                c["area"] += float(face_areas[i])
+                assigned = True
+                break
+        if not assigned:
+            clusters.append({"rep": n.copy(), "idx": [i], "area": float(face_areas[i])})
+    return clusters
 
 
-def correct_tilt(scan_pcd: o3d.geometry.PointCloud,
-                 tof_pcd: o3d.geometry.PointCloud):
+def cluster_faces_connected(
+    mesh: trimesh.Trimesh,
+    dot_threshold: float = 0.98,
+) -> list[dict]:
     """
-    Rotate the scan so its fitted plane normal aligns with the ToF plane normal.
-    Returns (transformed_scan_pcd, 4x4 transform matrix).
+    Cluster faces by similar normals AND spatial edge-connectivity.
+
+    Two faces belong to the same cluster only if they are connected through a
+    chain of edge-adjacent faces that all share a nearly parallel normal
+    (dot >= dot_threshold).  This finds the *largest exterior continuous
+    surface area* rather than the globally largest orientation group.
+
+    cluster dict:
+      rep:  area-weighted unit normal of the patch
+      idx:  list of face indices
+      area: total face area of the patch
     """
-    scan_pts = np.asarray(scan_pcd.points)
-    tof_pts = np.asarray(tof_pcd.points)
+    from collections import defaultdict
 
-    scan_normal = fit_plane(scan_pts)
-    tof_normal = fit_plane(tof_pts)
+    face_normals = np.asarray(mesh.face_normals, dtype=float)
+    face_areas = np.asarray(mesh.area_faces, dtype=float)
+    n_faces = len(face_normals)
 
-    # Ensure normals point in the same hemisphere
-    if np.dot(scan_normal, tof_normal) < 0:
-        scan_normal = -scan_normal
+    # 1) Assign each face to a normal group (greedy, by dot-product threshold)
+    group_reps: list[np.ndarray] = []
+    face_group = np.full(n_faces, -1, dtype=int)
+    for i, n in enumerate(face_normals):
+        for g_idx, rep in enumerate(group_reps):
+            if float(np.dot(n, rep)) >= dot_threshold:
+                face_group[i] = g_idx
+                break
+        if face_group[i] == -1:
+            face_group[i] = len(group_reps)
+            group_reps.append(n.copy())
 
-    R = rotation_between_vectors(scan_normal, tof_normal)
+    # 2) Union-Find: merge only adjacent faces that share the same normal group
+    parent = np.arange(n_faces, dtype=int)
 
-    # Build 4x4 transform, rotating about the scan centroid
-    centroid = scan_pts.mean(axis=0)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = centroid - R @ centroid  # rotate in place
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
 
-    scan_pcd_corrected = o3d.geometry.PointCloud(scan_pcd)
-    scan_pcd_corrected.transform(T)
+    def _union(x: int, y: int) -> None:
+        rx, ry = _find(x), _find(y)
+        if rx != ry:
+            parent[rx] = ry
 
-    print(f"  Scan plane normal : {scan_normal.round(4)}")
-    print(f"  ToF  plane normal : {tof_normal.round(4)}")
-    print(f"  Tilt correction R :\n{R.round(4)}")
+    for fi, fj in mesh.face_adjacency:  # (K, 2) pairs of edge-adjacent faces
+        if face_group[int(fi)] == face_group[int(fj)]:
+            _union(int(fi), int(fj))
 
-    return scan_pcd_corrected, T
+    # 3) Collect connected components into cluster dicts
+    comp: dict[int, list[int]] = defaultdict(list)
+    for i in range(n_faces):
+        comp[_find(i)].append(i)
+
+    clusters: list[dict] = []
+    for idx_list in comp.values():
+        idx_arr = np.array(idx_list, dtype=int)
+        n_vec = (face_normals[idx_arr] * face_areas[idx_arr, None]).sum(axis=0)
+        n_vec = _normalize(n_vec)
+        total_area = float(face_areas[idx_arr].sum())
+        clusters.append({"rep": n_vec, "idx": idx_list, "area": total_area})
+
+    return clusters
 
 
-# ─────────────────────────────────────────────
-# 3. Z SCALE CORRECTION
-# ─────────────────────────────────────────────
+def detect_bottom_normal(mesh: trimesh.Trimesh, dot_threshold: float = 0.98) -> Tuple[np.ndarray, list[int], list[dict]]:
+    # 1) Cluster by similar normals AND spatial connectivity so the "largest
+    #    cluster" is the largest *contiguous* flat surface, not a collection of
+    #    scattered same-orientation faces on different sides of the mesh.
+    clusters = cluster_faces_connected(mesh, dot_threshold=dot_threshold)
 
-def correct_z_scale(scan_pcd: o3d.geometry.PointCloud,
-                    tof_pcd: o3d.geometry.PointCloud,
-                    xy_radius: float = None,
-                    sample_pts: int = 5000):
+    # 2) Largest connected flat patch by area
+    best = max(clusters, key=lambda c: c["area"])
+    idx = best["idx"]
+
+    # 3) area-weighted avg normal (already stored in best["rep"])
+    n = best["rep"]
+
+    return n, idx, clusters
+
+
+def align_mesh_bottom_to_xy(
+    mesh: trimesh.Trimesh,
+    dot_threshold: float = 0.98,
+    centroid_mode: str = "bbox",  # "bbox" or "mean"
+) -> Tuple[trimesh.Trimesh, dict]:
     """
-    Compute Z scale: s_z = median(Z_tof / Z_scan) at nearest XY neighbours.
-
-    xy_radius : max XY distance to accept a pairing. Auto-computed as 5% of
-                the ToF XY bounding-box diagonal if not set via XY_RADIUS config.
-                Tightening this rejects cross-depth crevice mismatches that were
-                causing ~1/3 underscaling.
-    sample_pts: subsample scan to this many pts for matching (speed + stability).
+    1-10 as requested:
+      rotate bottom normal -> +Z
+      translate so minZ=0
+      center in XY
     """
-    scan_pts = np.asarray(scan_pcd.points).copy()
-    tof_pts  = np.asarray(tof_pcd.points).copy()
+    m = mesh.copy()
 
-    # Subsample scan points — median is stable with far fewer points
-    if len(scan_pts) > sample_pts:
-        idx = np.random.choice(len(scan_pts), sample_pts, replace=False)
-        scan_sample = scan_pts[idx]
+    bottom_n, bottom_faces, clusters = detect_bottom_normal(m, dot_threshold=dot_threshold)
+
+    # 6-7) rotate to +Z
+    R = _rotation_matrix_from_vectors(bottom_n, np.array([0.0, 0.0, 1.0]))
+    m.apply_transform(R)
+
+    # 8) translate so lowest Z = 0
+    min_z = float(m.vertices[:, 2].min())
+    Tz = trimesh.transformations.translation_matrix([0.0, 0.0, -min_z])
+    m.apply_transform(Tz)
+
+    # 9) XY centroid
+    if centroid_mode == "bbox":
+        c = m.bounding_box.centroid
+        xy_center = np.array([c[0], c[1], 0.0], dtype=float)
+    elif centroid_mode == "mean":
+        c = m.vertices.mean(axis=0)
+        xy_center = np.array([c[0], c[1], 0.0], dtype=float)
     else:
-        scan_sample = scan_pts
+        raise ValueError("centroid_mode must be 'bbox' or 'mean'")
 
-    # Auto xy_radius: 5% of the XY bounding box diagonal of the ToF cloud
-    if xy_radius is None:
-        tof_xy_range = tof_pts[:, :2].max(axis=0) - tof_pts[:, :2].min(axis=0)
-        xy_radius = 0.05 * np.linalg.norm(tof_xy_range)
-        print(f"  Auto XY match radius : {xy_radius:.4f} units")
+    # 10) translate so centroid at (0,0)
+    Txy = trimesh.transformations.translation_matrix([-xy_center[0], -xy_center[1], 0.0])
+    m.apply_transform(Txy)
 
-    # Build KD-tree on ToF XY only (Z zeroed so distance is purely lateral)
-    tof_pcd_2d = o3d.geometry.PointCloud()
-    tof_pcd_2d.points = o3d.utility.Vector3dVector(
-        np.column_stack([tof_pts[:, :2], np.zeros(len(tof_pts))]))
-    kd = o3d.geometry.KDTreeFlann(tof_pcd_2d)
+    info = {
+        "bottom_normal_original": bottom_n,
+        "bottom_faces_count": len(bottom_faces),
+        "clusters_count": len(clusters),
+        "largest_cluster_area": float(max(c["area"] for c in clusters)) if clusters else 0.0,
+        "min_z_after_rotation": min_z,
+        "xy_center_removed": xy_center,
+    }
+    return m, info
 
-    ratios = []
-    rejected = 0
-    for pt in scan_sample:
-        query = [pt[0], pt[1], 0.0]
-        _, idx, dist2 = kd.search_knn_vector_3d(query, 1)
-        xy_dist = np.sqrt(dist2[0])
 
-        # Reject pairs too far apart in XY — likely cross-surface crevice matches
-        if xy_dist > xy_radius:
-            rejected += 1
+def _apply_flip_x_180_in_place(mesh: trimesh.Trimesh) -> None:
+    """Rotate mesh 180 about +X and re-seat it on the XY plane (min Z = 0)."""
+    mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1.0, 0.0, 0.0]))
+    min_z = float(mesh.vertices[:, 2].min())
+    mesh.apply_transform(trimesh.transformations.translation_matrix([0.0, 0.0, -min_z]))
+
+
+# ----------------------------
+# Slicing + plotting check
+# ----------------------------
+def _section_3d_polylines(mesh: trimesh.Trimesh, origin_xyz: np.ndarray, normal_xyz: np.ndarray) -> List[np.ndarray]:
+    section = mesh.section(plane_origin=origin_xyz, plane_normal=normal_xyz)
+    if section is None:
+        return []
+    discrete = section.discrete
+    if callable(discrete):
+        discrete = discrete()
+    out = []
+    for seg in discrete:
+        arr = np.asarray(seg, dtype=float)
+        if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] >= 2:
+            out.append(arr)
+    return out
+
+
+def _project_3d_to_2d(polylines3d: List[np.ndarray], plane_key: str) -> List[np.ndarray]:
+    i0, i1 = PLANE_AXES_IDX[plane_key]
+    return [pl[:, [i0, i1]] for pl in polylines3d]
+
+
+def _plot_polylines2d(ax, polylines2d: List[np.ndarray], color: str, lw: float = 1.5, label: Optional[str] = None) -> list:
+    """Plot 2-D polylines on *ax* and return the list of Line2D objects."""
+    lines = []
+    first = True
+    for pl in polylines2d:
+        if pl.shape[0] < 2:
             continue
-
-        z_tof  = tof_pts[idx[0]][2]
-        z_scan = pt[2]
-
-        # Reject near-zero Z values (unreliable ratio)
-        if abs(z_scan) < 1e-3 or abs(z_tof) < 1e-3:
-            continue
-
-        # Outlier guard: discard ratios wildly outside expected range
-        ratio = z_tof / z_scan
-        if 0.1 < abs(ratio) < 10.0:
-            ratios.append(ratio)
-
-    print(f"  Pairs used : {len(ratios)}  |  rejected (XY too far) : {rejected}")
-
-    if not ratios:
-        print("  WARNING: Could not compute Z scale — no valid point pairs found.")
-        print("  Try increasing XY_RADIUS in CONFIG, or check that meshes overlap in XY.")
-        return scan_pcd, 1.0, scan_pts.mean(axis=0)
-
-    s_z = float(np.median(ratios))
-    print(f"  Z scale factor s_z = {s_z:.6f}")
-
-    # Apply Z scale: stretch Z around the centroid
-    centroid = scan_pts.mean(axis=0)
-    scan_pts_scaled = scan_pts.copy()
-    scan_pts_scaled[:, 2] = centroid[2] + (scan_pts[:, 2] - centroid[2]) * s_z
-
-    scan_pcd_scaled = o3d.geometry.PointCloud()
-    scan_pcd_scaled.points = o3d.utility.Vector3dVector(scan_pts_scaled)
-    if scan_pcd.has_normals():
-        scan_pcd_scaled.normals = scan_pcd.normals
-
-    return scan_pcd_scaled, s_z, centroid
+        if first and label is not None:
+            (ln,) = ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw, label=label)
+            first = False
+        else:
+            (ln,) = ax.plot(pl[:, 0], pl[:, 1], color=color, lw=lw)
+        lines.append(ln)
+    return lines
 
 
-# ─────────────────────────────────────────────
-# 4. ICP ALIGNMENT (COARSE + FINE)
-# ─────────────────────────────────────────────
-
-def run_icp(scan_pcd: o3d.geometry.PointCloud,
-            tof_pcd: o3d.geometry.PointCloud,
-            voxel_size: float = 1.0):
+def _attach_cursor(fig, all_lines: list) -> None:
     """
-    Two-stage ICP:
-      - Coarse: point-to-point ICP with large threshold
-      - Fine:   point-to-plane ICP with tight threshold
-    Returns (aligned_pcd, 4x4 transform).
-    """
+    Attach an interactive data cursor to *all_lines*.
 
-    def preprocess(pcd, vs):
-        pcd_down = pcd.voxel_down_sample(vs)
-        pcd_down.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 2, max_nn=30)
+    Tries mplcursors first (pip install mplcursors).
+    Falls back to a lightweight matplotlib motion-event annotation.
+    """
+    if _mplcursors is not None:
+        cursor = _mplcursors.cursor(all_lines, hover=True)
+
+        @cursor.connect("add")
+        def _on_add(sel):
+            x, y = sel.target
+            sel.annotation.set_text(f"x={x:.3f}\ny={y:.3f}")
+            sel.annotation.get_bbox_patch().set(fc="lightyellow", alpha=0.85)
+
+        return  # mplcursors handles everything
+
+    # --- Fallback: plain matplotlib event-based cursor ---
+    axes_set = {ln.axes for ln in all_lines if ln.axes is not None}
+    annots: dict = {}
+    for ax in axes_set:
+        ann = ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(12, 12),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray", alpha=0.85),
+            fontsize=8,
+            visible=False,
         )
-        return pcd_down
+        annots[ax] = ann
 
-    scan_down = preprocess(scan_pcd, voxel_size)
-    tof_down = preprocess(tof_pcd, voxel_size)
+    def _on_motion(event):
+        if event.inaxes is None:
+            for ann in annots.values():
+                if ann.get_visible():
+                    ann.set_visible(False)
+            fig.canvas.draw_idle()
+            return
 
-    # --- Coarse ICP (point-to-point) ---
-    threshold_coarse = voxel_size * 15
-    result_coarse = o3d.pipelines.registration.registration_icp(
-        scan_down, tof_down,
-        max_correspondence_distance=threshold_coarse,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
-    )
-    print(f"  Coarse ICP fitness : {result_coarse.fitness:.4f}  "
-          f"RMSE : {result_coarse.inlier_rmse:.4f}")
+        ax = event.inaxes
+        ann = annots.get(ax)
+        if ann is None:
+            return
 
-    # --- Fine ICP (point-to-plane) ---
-    threshold_fine = voxel_size * 2
-    result_fine = o3d.pipelines.registration.registration_icp(
-        scan_pcd, tof_pcd,
-        max_correspondence_distance=threshold_fine,
-        init=result_coarse.transformation,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200)
-    )
-    print(f"  Fine ICP   fitness : {result_fine.fitness:.4f}  "
-          f"RMSE : {result_fine.inlier_rmse:.4f}")
+        closest_dist = float("inf")
+        found_x = found_y = None
+        for ln in all_lines:
+            if ln.axes is not ax:
+                continue
+            xd = ln.get_xdata()
+            yd = ln.get_ydata()
+            if len(xd) == 0:
+                continue
+            # distance in display coords
+            try:
+                pts_display = ax.transData.transform(np.column_stack([xd, yd]))
+                cursor_display = np.array([event.x, event.y])
+                dists = np.linalg.norm(pts_display - cursor_display, axis=1)
+                idx = int(np.argmin(dists))
+                d = float(dists[idx])
+                if d < closest_dist:
+                    closest_dist = d
+                    found_x, found_y = float(xd[idx]), float(yd[idx])
+            except (ValueError, TypeError):
+                pass
 
-    scan_aligned = o3d.geometry.PointCloud(scan_pcd)
-    scan_aligned.transform(result_fine.transformation)
+        if found_x is not None and closest_dist < CURSOR_SNAP_THRESHOLD_PX:
+            ann.xy = (found_x, found_y)
+            ann.set_text(f"x={found_x:.3f}\ny={found_y:.3f}")
+            ann.set_visible(True)
+        else:
+            ann.set_visible(False)
+        fig.canvas.draw_idle()
 
-    return scan_aligned, result_fine.transformation
+    fig.canvas.mpl_connect("motion_notify_event", _on_motion)
 
 
-# ─────────────────────────────────────────────
-# 5. APPLY FINAL TRANSFORM TO THE ORIGINAL MESH
-# ─────────────────────────────────────────────
-
-def apply_transforms_to_mesh(mesh: o3d.geometry.TriangleMesh,
-                             tilt_T: np.ndarray,
-                             z_scale: float,
-                             z_centroid: np.ndarray,
-                             icp_T: np.ndarray) -> o3d.geometry.TriangleMesh:
+def _build_3plane_figure(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+) -> Tuple["plt.Figure", list]:
     """
-    Apply tilt correction, Z scale, and ICP transform to the original mesh vertices.
+    Build the 3-plane overlap figure and return ``(fig, all_lines)``.
+
+    Layout
+    ------
+    Left column  : XY plane, spanning both rows.
+    Right column : XZ (top row) and YZ (bottom row), repositioned after
+                   the initial draw so their combined vertical extent
+                   exactly matches the XY axes box.
+
+    A single shared legend is placed between the suptitle and the plots.
+    The caller is responsible for show / save / close.
     """
-    verts = np.asarray(mesh.vertices).copy()
+    origin = true_mesh.bounding_box.centroid
 
-    # Step 1: tilt correction
-    R = tilt_T[:3, :3]
-    t = tilt_T[:3, 3]
-    verts = (R @ verts.T).T + t
-
-    # Step 2: Z scale
-    verts[:, 2] = z_centroid[2] + (verts[:, 2] - z_centroid[2]) * z_scale
-
-    # Step 3: ICP transform
-    R_icp = icp_T[:3, :3]
-    t_icp = icp_T[:3, 3]
-    verts = (R_icp @ verts.T).T + t_icp
-
-    result_mesh = o3d.geometry.TriangleMesh()
-    result_mesh.vertices = o3d.utility.Vector3dVector(verts)
-    result_mesh.triangles = mesh.triangles
-    result_mesh.compute_vertex_normals()
-    return result_mesh
-
-
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
-def main():
-    if not TOF_STL_PATH or not SCAN_STL_PATH or not OUTPUT_STL_PATH:
-        raise ValueError("Set TOF_STL_PATH, SCAN_STL_PATH, and OUTPUT_STL_PATH in the CONFIG section.")
-
-    print("\n=== Loading STLs ===")
-    tof_pcd = load_stl_as_pcd(TOF_STL_PATH, samples=SAMPLES)
-    scan_pcd = load_stl_as_pcd(SCAN_STL_PATH, samples=SAMPLES)
-    scan_mesh = load_stl_mesh(SCAN_STL_PATH)
-    print(f"  ToF  : {len(tof_pcd.points)} points")
-    print(f"  Scan : {len(scan_pcd.points)} points")
-
-    # print("\n=== Step 1: Plane-fit tilt correction ===")
-    # scan_pcd, tilt_T = correct_tilt(scan_pcd, tof_pcd)
-    scan_pcd = scan_pcd  # no-op
-    tilt_T = np.eye(4)
-
-    print("\n=== Step 2: Z scale correction ===")
-    scan_pcd, s_z, z_centroid = correct_z_scale(scan_pcd, tof_pcd, xy_radius=XY_RADIUS)
-
-    print("\n=== Step 3: ICP alignment (coarse + fine) ===")
-    scan_pcd, icp_T = run_icp(scan_pcd, tof_pcd, voxel_size=VOXEL_SIZE)
-
-    print("\n=== Applying transforms to original mesh ===")
-    corrected_mesh = apply_transforms_to_mesh(
-        scan_mesh, tilt_T, s_z, z_centroid, icp_T
+    fig = plt.figure(figsize=(14, 8))
+    fig.suptitle(
+        "Cross-Sectional Comparison of Calibration Objects and ToF Measurements\n"
+        "Object: 04-00002   Distance: 15cm  FOV: 55",
+        fontsize=13,
+        y=0.97,
     )
 
-    print(f"\n=== Saving corrected STL → {OUTPUT_STL_PATH} ===")
-    o3d.io.write_triangle_mesh(OUTPUT_STL_PATH, corrected_mesh)
-    print("  Done.")
+    # Reserve the top ~10 % of the figure for the suptitle and legend.
+    gs = fig.add_gridspec(2, 2, top=0.87, bottom=0.07, left=0.08, right=0.95,
+                          hspace=0.06, wspace=0.30)
 
-    print("\n=== Summary of transforms applied ===")
-    print(f"  Tilt correction T :\n{tilt_T.round(4)}")
-    print(f"  Z scale factor    : {s_z:.6f}")
-    print(f"  ICP transform T   :\n{icp_T.round(4)}")
+    ax_xy = fig.add_subplot(gs[:, 0])   # spans both rows
+    ax_xz = fig.add_subplot(gs[0, 1])   # top-right
+    ax_yz = fig.add_subplot(gs[1, 1])   # bottom-right
+
+    all_lines: list = []
+
+    for ax, plane_key, title in zip(
+        [ax_xy, ax_xz, ax_yz], ["xy", "xz", "yz"], ["XY", "XZ", "YZ"]
+    ):
+        normal = PLANE_NORMAL[plane_key]
+        xlab, ylab = PLANE_AXES_LABEL[plane_key]
+
+        exp_3d = _section_3d_polylines(exp_mesh, origin, normal)
+        true_3d = _section_3d_polylines(true_mesh, origin, normal)
+
+        exp_2d = _project_3d_to_2d(exp_3d, plane_key)
+        true_2d = _project_3d_to_2d(true_3d, plane_key)
+
+        all_lines.extend(_plot_polylines2d(ax, true_2d, color="#18A5AA", lw=2.0, label="Actual"))
+        all_lines.extend(_plot_polylines2d(ax, exp_2d, color="#E97122", lw=1.2, label="Measured"))
+
+        ax.set_title(title)
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        _set_equal(ax)  # no per-axis legend
+
+    # Single shared legend between suptitle and the plots.
+    handles, labels = ax_xy.get_legend_handles_labels()
+    fig.legend(
+        handles, labels,
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 0.9),
+        frameon=True,
+        fontsize=10,
+    )
+
+    # --- Align XZ / YZ vertical extents to match the XY axes box ---
+    # canvas.draw() causes apply_aspect() to run, which updates each
+    # axis's _position to the actual aspect-adjusted bounding box.
+    fig.canvas.draw()
+
+    pos_xy = ax_xy.get_position()   # actual rendered position after aspect adjust
+    pos_xz = ax_xz.get_position()
+
+    x_r = pos_xz.x0
+    w_r = pos_xz.width
+    gap = 0.1   # no gap between XZ and YZ
+    half_h = (pos_xy.height - gap) / 2.0
+
+    ax_xz.set_position([x_r, pos_xy.y0 + half_h + gap, w_r, half_h])
+    ax_yz.set_position([x_r, pos_xy.y0,               w_r, half_h])
+
+    # Use adjustable="datalim" so the axes boxes hold their allocated height.
+    # With "box" (the default), matplotlib re-shrinks the box to match the
+    # data aspect ratio, which made the XZ/YZ panels stay short regardless
+    # of figsize or gap changes.
+    ax_xz.set_aspect("equal", adjustable="datalim")
+    ax_yz.set_aspect("equal", adjustable="datalim")
+
+    return fig, all_lines
 
 
+def show_overlap_outlines_3planes(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+    save_png: bool = False,
+    out_dir: str = "outputs",
+    filename_prefix: str = "overlap_check",
+) -> Optional[str]:
+    """
+    Slice both meshes along XY, XZ, YZ planes through TRUE centroid and overlay
+    outlines in an interactive matplotlib window.
+
+    Parameters
+    ----------
+    exp_mesh, true_mesh : trimesh.Trimesh
+        Aligned meshes to compare.
+    save_png : bool
+        When True the figure is also saved to *out_dir* as a timestamped PNG.
+    out_dir : str
+        Directory for the optional PNG output.
+    filename_prefix : str
+        Prefix for the PNG filename.
+
+    Returns
+    -------
+    str or None
+        Path to the saved PNG if *save_png* is True, else None.
+    """
+    fig, all_lines = _build_3plane_figure(exp_mesh, true_mesh)
+    _attach_cursor(fig, all_lines)
+
+    out_path: Optional[str] = None
+    if save_png:
+        _ensure_dir(out_dir)
+        out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
+        fig.savefig(out_path, dpi=200)
+        print("Wrote:", out_path)
+
+    plt.show()
+    return out_path
+
+
+def save_overlap_outlines_3planes(
+    exp_mesh: trimesh.Trimesh,
+    true_mesh: trimesh.Trimesh,
+    out_dir: str,
+    filename_prefix: str = "overlap_check",
+) -> str:
+    """
+    Backwards-compatible wrapper: always saves a PNG and closes the figure.
+
+    Prefer *show_overlap_outlines_3planes* for interactive use.
+    """
+    out_dir = _ensure_dir(out_dir)
+    fig, _ = _build_3plane_figure(exp_mesh, true_mesh)
+    out_path = os.path.join(out_dir, f"{filename_prefix}_{_ts()}.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+# ----------------------------
+# Example run
+# ----------------------------
 if __name__ == "__main__":
-    main()
+    out_dir = "outputs"
+
+    true_mesh = trimesh.load(TRUE_STL_PATH, force="mesh")
+    exp_mesh = trimesh.load(EXPERIMENT_STL_PATH, force="mesh")
+
+    true_aligned, true_info = align_mesh_bottom_to_xy(true_mesh, dot_threshold=0.98, centroid_mode="bbox")
+    exp_aligned, exp_info = align_mesh_bottom_to_xy(exp_mesh, dot_threshold=0.98, centroid_mode="bbox")
+
+    # Apply optional 180 flips AFTER alignment so align_mesh_bottom_to_xy
+    # cannot "correct" the flip while searching for the bottom.
+    if TRUE_STL_FLIP_180:
+        _apply_flip_x_180_in_place(true_aligned)
+
+    if EXPERIMENT_STL_FLIP_180:
+        _apply_flip_x_180_in_place(exp_aligned)
+
+    # Show interactive overlap plot (optionally saves PNG when SAVE_PNG=True).
+    show_overlap_outlines_3planes(
+        exp_aligned,
+        true_aligned,
+        save_png=SAVE_PNG,
+        out_dir=out_dir,
+        filename_prefix="aligned_overlap_3planes",
+    )
+
+    # Export aligned STLs only when explicitly requested.
+    if EXPORT_STL:
+        _ensure_dir(out_dir)
+        true_aligned.export(os.path.join(out_dir, f"true_aligned_{_ts()}.stl"))
+        exp_aligned.export(os.path.join(out_dir, f"experiment_aligned_{_ts()}.stl"))
+        print("Exported aligned STL files to", out_dir)
