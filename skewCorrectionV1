@@ -9,10 +9,12 @@ from scipy.ndimage import gaussian_filter, sobel, label
 # ============================================================
 
 INPUT_PLY  = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
-OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedV2.ply"
+OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedV6.ply"
+OUTPUT_PLY2 = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.ply"
 
 GRID_RES        = 128     # resolution of height grid
 EDGE_THRESHOLD  = None    # None = auto threshold
+shift = 1000 # shifting the floor plane down (don't know why 1000 is good-but hey don't question)
 
 import numpy as np
 import open3d as o3d
@@ -126,20 +128,72 @@ def main():
     print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
     # Plane subtraction
-    z_plane = a * pts[:, 0] + b * pts[:, 1] + c
+    z_plane = a * pts[:, 0] + b * pts[:, 1] + (c-shift)
     z_new = pts[:, 2] - z_plane
 
     # Clamp below-plane
     z_new[z_new < 0] = 0.0
     pts[:, 2] = z_new
 
+    # --- REMOVE FLOOR POINTS HERE ---
+    pts = pts[~object_mask]
+
     # Write output
     pcd.points = o3d.utility.Vector3dVector(pts)
     o3d.io.write_point_cloud(OUTPUT_PLY, pcd)
 
+    # Write output
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    o3d.io.write_point_cloud(OUTPUT_PLY, pcd)
+
+
+
+
     print("✅ Corrected PLY written to:", OUTPUT_PLY)
 
-
+    # # -----------------------------
+    # # 1. Estimate normals
+    # # -----------------------------
+    # pcd = o3d.io.read_point_cloud(OUTPUT_PLY)  # or your filtered cloud
+    # pcd.estimate_normals(
+    #     search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
+    # )
+    #
+    # # IMPORTANT: orient normals consistently
+    # pcd.orient_normals_consistent_tangent_plane(50)
+    #
+    # # -----------------------------
+    # # 2. Poisson reconstruction
+    # # -----------------------------
+    # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+    #     pcd, depth=9
+    # )
+    #
+    # # -----------------------------
+    # # 3. Remove low-density artifacts
+    # # -----------------------------
+    # densities = np.asarray(densities)
+    # vertices_to_keep = densities > np.quantile(densities, 0.02)
+    #
+    # mesh = mesh.select_by_index(np.where(vertices_to_keep)[0])
+    #
+    # # Optional: crop to bounding box of original cloud
+    # bbox = pcd.get_axis_aligned_bounding_box()
+    # mesh = mesh.crop(bbox)
+    #
+    # # -----------------------------
+    # # 4. Clean up mesh
+    # # -----------------------------
+    # mesh.remove_degenerate_triangles()
+    # mesh.remove_duplicated_triangles()
+    # mesh.remove_duplicated_vertices()
+    # mesh.remove_non_manifold_edges()
+    # mesh.compute_vertex_normals()
+    #
+    # # Save
+    # o3d.io.write_triangle_mesh(OUTPUT_PLY2, mesh)
+    #
+    # print("✅ Watertight mesh saved")
 # ============================================================
 # IDE ENTRY POINT
 # ============================================================
