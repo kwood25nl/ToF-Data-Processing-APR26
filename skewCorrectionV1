@@ -1,0 +1,148 @@
+import numpy as np
+import open3d as o3d
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter, sobel, label
+
+
+# ============================================================
+# USER SETTINGS (EDIT THESE)
+# ============================================================
+
+INPUT_PLY  = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
+OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedV2.ply"
+
+GRID_RES        = 128     # resolution of height grid
+EDGE_THRESHOLD  = None    # None = auto threshold
+
+import numpy as np
+import open3d as o3d
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter, sobel, label
+
+# ============================================================
+# OBJECT / FLOOR DETECTION
+# ============================================================
+
+def detect_floor_boundary(pts, grid_res=128, edge_threshold=None):
+    """
+    Returns:
+        True  -> object
+        False -> floor
+    """
+    xy = pts[:, :2]
+    z  = pts[:, 2]
+
+    x_min, y_min = xy.min(axis=0)
+    x_max, y_max = xy.max(axis=0)
+
+    gx = np.linspace(x_min, x_max, grid_res)
+    gy = np.linspace(y_min, y_max, grid_res)
+    gxx, gyy = np.meshgrid(gx, gy)
+
+    grid_z = griddata(xy, z, (gxx, gyy), method="linear")
+
+    if np.isnan(grid_z).all():
+        print("WARNING: Heightmap invalid — treating all points as object")
+        return np.ones(len(pts), dtype=bool)
+
+    grid_z[np.isnan(grid_z)] = np.nanmean(grid_z)
+
+    smoothed = gaussian_filter(grid_z, sigma=2)
+    grad_x = sobel(smoothed, axis=1)
+    grad_y = sobel(smoothed, axis=0)
+    grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+
+    if edge_threshold is None:
+        edge_threshold = grad_mag.mean() + 2.0 * grad_mag.std()
+
+    edge_map = grad_mag > edge_threshold
+    interior, n_labels = label(~edge_map)
+
+    center = np.array([grid_res / 2, grid_res / 2])
+    best_label, best_dist = None, np.inf
+
+    for lbl in range(1, n_labels + 1):
+        region = np.argwhere(interior == lbl)
+        if len(region) < 10:
+            continue
+        centroid = region.mean(axis=0)
+        d = np.linalg.norm(centroid - center)
+        if d < best_dist:
+            best_dist = d
+            best_label = lbl
+
+    if best_label is None:
+        print("WARNING: Object region not found")
+        return np.ones(len(pts), dtype=bool)
+
+    object_grid = interior == best_label
+
+    ix = np.clip(
+        ((xy[:, 0] - x_min) / (x_max - x_min) * (grid_res - 1)).astype(int),
+        0, grid_res - 1
+    )
+    iy = np.clip(
+        ((xy[:, 1] - y_min) / (y_max - y_min) * (grid_res - 1)).astype(int),
+        0, grid_res - 1
+    )
+
+    object_mask = object_grid[iy, ix]
+    print(f"Object points: {object_mask.sum()} | Floor points: {(~object_mask).sum()}")
+
+    return object_mask
+
+
+# ============================================================
+# PLANE FIT: z = ax + by + c
+# ============================================================
+
+def fit_plane(xyz):
+    X = np.c_[xyz[:, 0], xyz[:, 1], np.ones(len(xyz))]
+    y = xyz[:, 2]
+    return np.linalg.lstsq(X, y, rcond=None)[0]
+
+
+# ============================================================
+# MAIN PIPELINE (RUNS WHEN YOU CLICK ▶)
+# ============================================================
+
+def main():
+    print("Loading:", INPUT_PLY)
+    pcd = o3d.io.read_point_cloud(INPUT_PLY)
+    pts = np.asarray(pcd.points)
+
+    if len(pts) == 0:
+        raise RuntimeError("PLY file contains no points")
+
+    # Separate object vs floor
+    object_mask = detect_floor_boundary(pts, GRID_RES)
+    floor_pts = pts[~object_mask]
+
+    if len(floor_pts) < 50:
+        raise RuntimeError("Too few floor points for plane fitting")
+
+    # Fit plane to floor
+    a, b, c = fit_plane(floor_pts)
+    print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
+
+    # Plane subtraction
+    z_plane = a * pts[:, 0] + b * pts[:, 1] + c
+    z_new = pts[:, 2] - z_plane
+
+    # Clamp below-plane
+    z_new[z_new < 0] = 0.0
+    pts[:, 2] = z_new
+
+    # Write output
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    o3d.io.write_point_cloud(OUTPUT_PLY, pcd)
+
+    print("✅ Corrected PLY written to:", OUTPUT_PLY)
+
+
+# ============================================================
+# IDE ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
