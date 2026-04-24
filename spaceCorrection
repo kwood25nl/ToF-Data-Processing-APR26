@@ -2,9 +2,10 @@
 align_stl.py
 ------------
 Aligns a 3D camera scan STL to a ToF (ground-truth) STL using:
-  1. Plane-fit tilt correction  — removes Z tilt between the two meshes
-  2. Z scale correction         — fixes depth scale using ToF Z as ground truth
-  3. ICP (coarse + fine)        — cleans up residual misalignment
+  1. Floor-fit tilt correction  — removes Z tilt using detected floor plane (scan only)
+  2. Width restoration          — fixes apparent XY compression introduced by detilt
+  3. Z scale correction         — fixes depth scale using ToF Z as ground truth
+  4. ICP (coarse + fine)        — cleans up residual misalignment
 
 Usage:
   1) Paste your paths into the CONFIG section below
@@ -23,8 +24,7 @@ from scipy.interpolate import griddata
 # ─────────────────────────────────────────────
 TOF_STL_PATH    = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\outputs_FOV55-20260422_163657\sc139_3DHeatmap.stl"
 SCAN_STL_PATH   = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\shifted139_Output\20260413_164304\CorrectionV6.stl"
-OUTPUT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Correction Tests/OutputV4.stl"
-
+OUTPUT_STL_PATH = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Correction Tests/OutputV6.stl"
 
 
 SAMPLES    = 50000
@@ -37,8 +37,8 @@ RIM_PERCENTILE  = 95    # top X% of Z values = rim / tallest surface
 PEAK_PERCENTILE = 5     # bottom X% of Z values = deepest point (peak of cavity)
 
 # ── Floor detection + skew correction (scan only) ────────────────────────────
-REMOVE_FLOOR         = True   # True: detect floor, correct skew, then exclude floor
-                               # False: skip all floor logic (use for real scans)
+REMOVE_FLOOR         = True   # True: detect floor + detilt + restore width + exclude floor for Z range
+                               # False: skip all floor/detilt logic (use for real scans)
 FLOOR_EDGE_THRESHOLD = None   # Z-gradient magnitude to call an edge. None = auto.
                                # Increase if floor bleeds into object; decrease if
                                # edge is missed entirely.
@@ -94,15 +94,13 @@ def detect_floor_boundary(pts: np.ndarray,
     # ── Build 2D heightmap ────────────────────────────────────────────────────
     x_min, y_min = xy.min(axis=0)
     x_max, y_max = xy.max(axis=0)
-    # grid cell size
+
     gx = np.linspace(x_min, x_max, grid_res)
     gy = np.linspace(y_min, y_max, grid_res)
     gxx, gyy = np.meshgrid(gx, gy)
 
-    # interpolate scattered Z onto regular grid (linear, fill edges with nan)
     grid_z = griddata(xy, z, (gxx, gyy), method='linear')
 
-    # fill nans with local mean for gradient computation
     nan_mask = np.isnan(grid_z)
     if nan_mask.all():
         print("  WARNING: heightmap entirely NaN — floor detection skipped.")
@@ -116,7 +114,6 @@ def detect_floor_boundary(pts: np.ndarray,
     grad_y    = sobel(smoothed, axis=0)
     grad_mag  = np.sqrt(grad_x**2 + grad_y**2)
 
-    # ── Auto threshold = mean + 2*std of gradient, or manual override ─────────
     if edge_threshold is None:
         edge_threshold = grad_mag.mean() + 2.0 * grad_mag.std()
         print(f"  Auto edge threshold : {edge_threshold:.4f}")
@@ -126,17 +123,14 @@ def detect_floor_boundary(pts: np.ndarray,
     edge_map = grad_mag > edge_threshold
 
     # ── Find object mask: largest connected region that is NOT edge ───────────
-    # Label connected non-edge regions
     interior_candidates, n_labels = label(~edge_map)
 
-    # Find the label whose centroid is closest to the grid centre
-    # (the object is assumed to be roughly central)
     grid_centre = np.array([grid_res / 2, grid_res / 2])
     best_label  = None
     best_dist   = np.inf
     for lbl in range(1, n_labels + 1):
         region = np.argwhere(interior_candidates == lbl)
-        if len(region) < 4:          # skip tiny noise regions
+        if len(region) < 4:
             continue
         centroid = region.mean(axis=0)
         dist = np.linalg.norm(centroid - grid_centre)
@@ -151,7 +145,6 @@ def detect_floor_boundary(pts: np.ndarray,
     object_grid_mask = (interior_candidates == best_label)
 
     # ── Map grid mask back to original point indices ──────────────────────────
-    # For each point, find its grid cell and check mask
     ix = np.clip(((xy[:, 0] - x_min) / (x_max - x_min) * (grid_res - 1)).astype(int),
                  0, grid_res - 1)
     iy = np.clip(((xy[:, 1] - y_min) / (y_max - y_min) * (grid_res - 1)).astype(int),
@@ -188,7 +181,9 @@ def detilt_by_floor(pts: np.ndarray, floor_pts: np.ndarray,
     invert : flip the floor normal before computing the rotation.
              Use this if the correction makes the tilt worse instead of better.
 
-    Returns (detilted_pts, 3x3 rotation matrix R).
+    Returns (detilted_pts, 3x3 rotation matrix R, rot_axis_unit).
+      - rot_axis_unit is the Rodrigues rotation axis direction (unit).
+        If no detilt is needed, rot_axis_unit = [0,0,0].
     """
     floor_normal = fit_plane_to_points(floor_pts)
 
@@ -202,14 +197,15 @@ def detilt_by_floor(pts: np.ndarray, floor_pts: np.ndarray,
         floor_normal = floor_normal / np.linalg.norm(floor_normal)
 
     target = np.array([0.0, 0.0, 1.0])
-    v = -np.cross(floor_normal, target)
+    v = -np.cross(floor_normal, target)   # Rodrigues axis * sin(theta)
     c = np.dot(floor_normal, target)
     s = np.linalg.norm(v)
 
     if s < 1e-6:
-        # Already aligned
         print("  Floor plane already horizontal — no detilt needed.")
-        return pts, np.eye(3)
+        return pts, np.eye(3), np.zeros(3)
+
+    rot_axis_unit = v / s
 
     kmat = np.array([[    0, -v[2],  v[1]],
                      [ v[2],     0, -v[0]],
@@ -223,8 +219,54 @@ def detilt_by_floor(pts: np.ndarray, floor_pts: np.ndarray,
     angle_deg = np.degrees(np.arccos(np.clip(c, -1, 1)))
     print(f"  Floor plane normal : {floor_normal.round(4)}")
     print(f"  Detilt angle       : {angle_deg:.3f} deg")
+    print(f"  Rot axis (unit)    : {rot_axis_unit.round(4)}")
 
-    return pts_rotated, R
+    return pts_rotated, R, rot_axis_unit
+
+
+def restore_width_along_axis_xy(pts: np.ndarray,
+                                axis: np.ndarray,
+                                original_pts: np.ndarray,
+                                centroid: np.ndarray = None,
+                                eps: float = 1e-9) -> tuple:
+    """
+    Restore width ONLY along the tilt axis direction, measured in XY.
+
+    - Uses axis projected into XY (so we scale in-plane, not in Z).
+    - Width = max/min of dot((xy - centroid_xy), axis_xy_unit)
+
+    Returns (pts_corrected, scale_factor).
+    """
+    axis = np.asarray(axis, dtype=float)
+
+    # Project axis into XY and normalize
+    a_xy = axis[:2].copy()
+    n = np.linalg.norm(a_xy)
+    if n < eps:
+        return pts, 1.0
+    a_xy /= n
+
+    if centroid is None:
+        centroid = original_pts.mean(axis=0)
+    c_xy = centroid[:2]
+
+    def extent_xy(p):
+        proj = (p[:, :2] - c_xy) @ a_xy
+        return proj.max() - proj.min()
+
+    w0 = extent_xy(original_pts)
+    w1 = extent_xy(pts)
+    if w0 < eps or w1 < eps:
+        return pts, 1.0
+
+    s = w0 / w1
+
+    # Apply scale ONLY along a_xy in XY, leaving Z unchanged
+    proj = (pts[:, :2] - c_xy) @ a_xy  # (N,)
+    pts_corr = pts.copy()
+    pts_corr[:, :2] += (s - 1.0) * proj[:, None] * a_xy[None, :]
+
+    return pts_corr, s
 
 
 def _z_range(pts: np.ndarray, rim_pct: float, peak_pct: float) -> tuple:
@@ -245,19 +287,24 @@ def center_and_scale_z(scan_pcd: o3d.geometry.PointCloud,
     Full pipeline:
       1. Floor detection via 2D Z-gradient edge detection (scan only)
       2. Floor skew correction — fit plane to floor, de-tilt whole mesh
-      3. XY centering — align scan XY centroid to ToF XY centroid
-      4. Z scaling — match rim-to-peak depth range to ToF, pivot at rim
+      3. Width restoration in XY along detilt axis (scan only, when remove_floor=True)
+      4. XY centering — align scan XY centroid to ToF XY centroid
+      5. Z scaling — match rim-to-peak depth range to ToF, pivot at rim
 
-    Returns (corrected_pcd, xy_shift, s_z, z_rim, detilt_R, detilt_centroid).
-    detilt_R and detilt_centroid are needed to apply the same transform to the mesh.
+    Returns (corrected_pcd, xy_shift, s_z, z_rim, detilt_R, detilt_centroid,
+             rot_axis_unit, axis_scale).
+    detilt_R, detilt_centroid, rot_axis_unit, axis_scale are needed to apply the same
+    transform to the original mesh.
     """
     scan_pts = np.asarray(scan_pcd.points).copy()
     tof_pts  = np.asarray(tof_pcd.points).copy()
 
     detilt_R        = np.eye(3)
     detilt_centroid = scan_pts.mean(axis=0)
+    rot_axis_unit   = np.zeros(3)
+    axis_scale      = 1.0
 
-    # ── Step 1 & 2: Floor detection + skew correction (scan only) ─────────────
+    # ── Step 1 & 2 & 3: Floor detection + skew correction + width restore ─────
     if remove_floor:
         print("  Running floor boundary detection on scan...")
         obj_mask = detect_floor_boundary(scan_pts, grid_res=grid_res,
@@ -269,9 +316,20 @@ def center_and_scale_z(scan_pcd: o3d.geometry.PointCloud,
             print("  WARNING: Too few floor points detected — skipping skew correction.")
         else:
             print("  Fitting floor plane and de-tilting scan...")
+            pre_detilt_pts = scan_pts.copy()
+
             detilt_centroid = scan_pts.mean(axis=0)
-            scan_pts, detilt_R = detilt_by_floor(scan_pts, floor_pts, invert=invert_detilt)
-            # Recompute object mask on de-tilted points for Z range
+            scan_pts, detilt_R, rot_axis_unit = detilt_by_floor(
+                scan_pts, floor_pts, invert=invert_detilt
+            )
+
+            # Always restore width when remove_floor=True (per your requirement)
+            scan_pts, axis_scale = restore_width_along_axis_xy(
+                scan_pts, rot_axis_unit, pre_detilt_pts, centroid=detilt_centroid
+            )
+            print(f"  Width restore (axis, XY) scale = {axis_scale:.6f}")
+
+            # Recompute object mask selection on the updated points
             object_pts = scan_pts[obj_mask]
 
         # Use only object points for Z range computation
@@ -279,7 +337,7 @@ def center_and_scale_z(scan_pcd: o3d.geometry.PointCloud,
     else:
         z_pts_scan = scan_pts
 
-    # ── Step 3: XY centering ──────────────────────────────────────────────────
+    # ── Step 4: XY centering ──────────────────────────────────────────────────
     scan_xy_centroid = scan_pts[:, :2].mean(axis=0)
     tof_xy_centroid  = tof_pts[:, :2].mean(axis=0)
     xy_shift         = tof_xy_centroid - scan_xy_centroid
@@ -288,7 +346,7 @@ def center_and_scale_z(scan_pcd: o3d.geometry.PointCloud,
     z_pts_scan[:, :2] += xy_shift
     print(f"  XY shift applied   : {xy_shift.round(4)}")
 
-    # ── Step 4: Z scaling ─────────────────────────────────────────────────────
+    # ── Step 5: Z scaling ─────────────────────────────────────────────────────
     tof_rim,  tof_peak  = _z_range(tof_pts,    rim_pct, peak_pct)
     scan_rim, scan_peak = _z_range(z_pts_scan, rim_pct, peak_pct)
 
@@ -312,7 +370,7 @@ def center_and_scale_z(scan_pcd: o3d.geometry.PointCloud,
     if scan_pcd.has_normals():
         result_pcd.normals = scan_pcd.normals
 
-    return result_pcd, xy_shift, s_z, scan_rim, detilt_R, detilt_centroid
+    return result_pcd, xy_shift, s_z, scan_rim, detilt_R, detilt_centroid, rot_axis_unit, axis_scale
 
 
 # ─────────────────────────────────────────────
@@ -378,26 +436,37 @@ def apply_transforms_to_mesh(mesh: o3d.geometry.TriangleMesh,
                              xy_shift: np.ndarray,
                              z_scale: float,
                              z_rim: float,
-                             icp_T: np.ndarray) -> o3d.geometry.TriangleMesh:
+                             icp_T: np.ndarray,
+                             rot_axis_unit: np.ndarray,
+                             axis_scale: float) -> o3d.geometry.TriangleMesh:
     """
     Apply (in order):
       1. Floor de-tilt rotation (about scan centroid)
-      2. XY centering shift
-      3. Z scale about rim
-      4. ICP transform
+      2. Restore width in XY along detilt axis (about same centroid)
+      3. XY centering shift
+      4. Z scale about rim
+      5. ICP transform
     """
     verts = np.asarray(mesh.vertices).copy()
 
     # Step 1: floor de-tilt (rotate about the scan centroid)
-    verts = -(detilt_R @ (verts - detilt_centroid).T).T + detilt_centroid
+    verts = (detilt_R @ (verts - detilt_centroid).T).T + detilt_centroid
 
-    # Step 2: XY centering
+    # Step 2: restore width in XY along detilt axis direction
+    if rot_axis_unit is not None and np.linalg.norm(rot_axis_unit[:2]) > 1e-9 and abs(axis_scale - 1.0) > 1e-6:
+        a_xy = rot_axis_unit[:2].astype(float)
+        a_xy /= np.linalg.norm(a_xy)
+        c_xy = detilt_centroid[:2]
+        proj = (verts[:, :2] - c_xy) @ a_xy
+        verts[:, :2] += (axis_scale - 1.0) * proj[:, None] * a_xy[None, :]
+
+    # Step 3: XY centering
     verts[:, :2] += xy_shift
 
-    # Step 3: Z scale about the rim level
+    # Step 4: Z scale about the rim level
     verts[:, 2] = z_rim + (verts[:, 2] - z_rim) * z_scale
 
-    # Step 4: ICP transform
+    # Step 5: ICP transform
     R_icp = icp_T[:3, :3]
     t_icp = icp_T[:3, 3]
     verts = (R_icp @ verts.T).T + t_icp
@@ -424,15 +493,15 @@ def main():
     print(f"  ToF  : {len(tof_pcd.points)} points")
     print(f"  Scan : {len(scan_pcd.points)} points")
 
-    print("\n=== Step 1: Floor detection, skew correction, XY center + Z scale ===")
-    scan_pcd, xy_shift, s_z, z_rim, detilt_R, detilt_centroid = center_and_scale_z(
+    print("\n=== Step 1: Floor detilt + width restore + XY center + Z scale ===")
+    scan_pcd, xy_shift, s_z, z_rim, detilt_R, detilt_centroid, rot_axis_unit, axis_scale = center_and_scale_z(
         scan_pcd, tof_pcd,
         rim_pct=RIM_PERCENTILE,
         peak_pct=PEAK_PERCENTILE,
         remove_floor=REMOVE_FLOOR,
         grid_res=FLOOR_GRID_RES,
         edge_threshold=FLOOR_EDGE_THRESHOLD,
-        invert_detilt=INVERT_DETILT,
+        invert_detilt=False,   # keep available, but disabled by default
     )
 
     print("\n=== Step 2: ICP alignment (coarse + fine) ===")
@@ -440,7 +509,8 @@ def main():
 
     print("\n=== Applying transforms to original mesh ===")
     corrected_mesh = apply_transforms_to_mesh(
-        scan_mesh, detilt_R, detilt_centroid, xy_shift, s_z, z_rim, icp_T
+        scan_mesh, detilt_R, detilt_centroid, xy_shift, s_z, z_rim, icp_T,
+        rot_axis_unit, axis_scale
     )
 
     print(f"\n=== Saving corrected STL → {OUTPUT_STL_PATH} ===")
@@ -448,11 +518,13 @@ def main():
     print("  Done.")
 
     print("\n=== Summary of transforms applied ===")
-    print(f"  Floor detilt R    :\n{detilt_R.round(4)}")
-    print(f"  XY shift          : {xy_shift.round(4)}")
-    print(f"  Z scale factor    : {s_z:.6f}")
-    print(f"  Z rim reference   : {z_rim:.4f}")
-    print(f"  ICP transform T   :\n{icp_T.round(4)}")
+    print(f"  Floor detilt R           :\n{detilt_R.round(4)}")
+    print(f"  Detilt rot axis (unit)   : {rot_axis_unit.round(4)}")
+    print(f"  Width restore axis scale : {axis_scale:.6f}")
+    print(f"  XY shift                 : {xy_shift.round(4)}")
+    print(f"  Z scale factor           : {s_z:.6f}")
+    print(f"  Z rim reference          : {z_rim:.4f}")
+    print(f"  ICP transform T          :\n{icp_T.round(4)}")
 
 
 if __name__ == "__main__":
