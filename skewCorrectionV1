@@ -1,5 +1,6 @@
 import numpy as np
 import open3d as o3d
+from collections import Counter
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, sobel, label
 
@@ -69,7 +70,77 @@ def detect_floor_boundary(pts, grid_res=150):
 
     return object_grid[iy, ix]
 
+import numpy as np
+import open3d as o3d
 
+def cut_mesh_at_z(mesh, z_cut):
+    """
+    Cuts mesh with plane Z = z_cut
+    Deletes geometry below the plane
+    Leaves an open (uncapped) flat bottom
+    """
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+
+    new_vertices = vertices.tolist()
+    new_triangles = []
+
+    def intersect(v1, v2):
+        """Linear interpolation for z-plane intersection"""
+        t = (z_cut - v1[2]) / (v2[2] - v1[2])
+        return v1 + t * (v2 - v1)
+
+    for tri in triangles:
+        pts = vertices[tri]
+        above = pts[:, 2] >= z_cut
+
+        if np.all(above):
+            # Fully above plane → keep triangle
+            new_triangles.append(tri.tolist())
+
+        elif np.any(above):
+            # Triangle is intersected by plane
+            kept = pts[above]
+            cut = pts[~above]
+
+            if len(kept) == 1:
+                v0 = kept[0]
+                v1 = intersect(v0, cut[0])
+                v2 = intersect(v0, cut[1])
+
+                i0 = new_vertices.index(v0.tolist())
+                i1 = len(new_vertices)
+                new_vertices.append(v1.tolist())
+                i2 = len(new_vertices)
+                new_vertices.append(v2.tolist())
+
+                new_triangles.append([i0, i1, i2])
+
+            elif len(kept) == 2:
+                v0, v1 = kept
+                v2 = intersect(v0, cut[0])
+                v3 = intersect(v1, cut[0])
+
+                i0 = new_vertices.index(v0.tolist())
+                i1 = new_vertices.index(v1.tolist())
+                i2 = len(new_vertices)
+                new_vertices.append(v2.tolist())
+                i3 = len(new_vertices)
+                new_vertices.append(v3.tolist())
+
+                new_triangles.append([i0, i1, i2])
+                new_triangles.append([i1, i3, i2])
+
+    clipped_mesh = o3d.geometry.TriangleMesh()
+    clipped_mesh.vertices = o3d.utility.Vector3dVector(np.array(new_vertices))
+    clipped_mesh.triangles = o3d.utility.Vector3iVector(np.array(new_triangles))
+    clipped_mesh.remove_duplicated_vertices()
+    clipped_mesh.remove_duplicated_triangles()
+    clipped_mesh.remove_degenerate_triangles()
+    clipped_mesh.compute_vertex_normals()
+
+    return clipped_mesh
 # ============================================================
 # PLANE FIT: z = ax + by + c
 # ============================================================
@@ -131,8 +202,59 @@ def main():
     mesh.compute_vertex_normals()
 
     # --------------------------------------------------------
+    # Flatten Bottom
+    # --------------------------------------------------------
+
+    min_z = np.asarray(mesh.vertices)[:, 2].min()
+    mesh.translate((0, 0, -min_z))
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+
+    bbox = mesh.get_axis_aligned_bounding_box()
+    min_bound = bbox.min_bound
+    max_bound = bbox.max_bound
+
+    print("Bounding box min:", min_bound)
+    print("Bounding box max:", max_bound)
+    print("Extent:", max_bound - min_bound)
+
+    # Collect all edges from triangles
+    edges = []
+    for tri in triangles:
+        edges.append(tuple(sorted((tri[0], tri[1]))))
+        edges.append(tuple(sorted((tri[1], tri[2]))))
+        edges.append(tuple(sorted((tri[2], tri[0]))))
+
+    # Count how many times each edge occurs
+    edge_count = Counter(edges)
+
+    # Boundary edges occur exactly once
+    boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
+
+    if len(boundary_edges) == 0:
+        raise ValueError("Mesh has no boundary edges (mesh may be closed).")
+
+    # Unique vertex indices on boundary
+    boundary_vertices = np.unique(np.array(boundary_edges))
+
+    # Extract Z values
+    z_values = vertices[boundary_vertices, 2]
+
+    # Max Z
+    max_z = z_values.max()
+
+    mesh = cut_mesh_at_z(mesh, max_z)
+
+    bbox = mesh.get_axis_aligned_bounding_box()
+    print("New min Z:", bbox.min_bound[2])  # should be ~z_cut
+
+
+
+    # --------------------------------------------------------
     # Save
     # --------------------------------------------------------
+
     o3d.io.write_triangle_mesh(OUTPUT_PLY, mesh)
     print("✅ Corrected mesh written with original topology preserved")
 
