@@ -3,34 +3,22 @@ import open3d as o3d
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, sobel, label
 
-
 # ============================================================
-# USER SETTINGS (EDIT THESE)
+# USER SETTINGS
 # ============================================================
 
 INPUT_PLY  = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
-OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedV6.ply"
-OUTPUT_PLY2 = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.ply"
+OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.ply"
 
-GRID_RES        = 128     # resolution of height grid
-EDGE_THRESHOLD  = None    # None = auto threshold
-shift = 1000 # shifting the floor plane down (don't know why 1000 is good-but hey don't question)
+GRID_RES = 128
+shift = 1000  # plane offset
 
-import numpy as np
-import open3d as o3d
-from scipy.interpolate import griddata
-from scipy.ndimage import gaussian_filter, sobel, label
 
 # ============================================================
-# OBJECT / FLOOR DETECTION
+# OBJECT / FLOOR DETECTION (UNCHANGED)
 # ============================================================
 
-def detect_floor_boundary(pts, grid_res=128, edge_threshold=None):
-    """
-    Returns:
-        True  -> object
-        False -> floor
-    """
+def detect_floor_boundary(pts, grid_res=150):
     xy = pts[:, :2]
     z  = pts[:, 2]
 
@@ -44,7 +32,6 @@ def detect_floor_boundary(pts, grid_res=128, edge_threshold=None):
     grid_z = griddata(xy, z, (gxx, gyy), method="linear")
 
     if np.isnan(grid_z).all():
-        print("WARNING: Heightmap invalid — treating all points as object")
         return np.ones(len(pts), dtype=bool)
 
     grid_z[np.isnan(grid_z)] = np.nanmean(grid_z)
@@ -54,10 +41,9 @@ def detect_floor_boundary(pts, grid_res=128, edge_threshold=None):
     grad_y = sobel(smoothed, axis=0)
     grad_mag = np.sqrt(grad_x**2 + grad_y**2)
 
-    if edge_threshold is None:
-        edge_threshold = grad_mag.mean() + 2.0 * grad_mag.std()
-
+    edge_threshold = grad_mag.mean() + 2.0 * grad_mag.std()
     edge_map = grad_mag > edge_threshold
+
     interior, n_labels = label(~edge_map)
 
     center = np.array([grid_res / 2, grid_res / 2])
@@ -74,24 +60,14 @@ def detect_floor_boundary(pts, grid_res=128, edge_threshold=None):
             best_label = lbl
 
     if best_label is None:
-        print("WARNING: Object region not found")
         return np.ones(len(pts), dtype=bool)
 
     object_grid = interior == best_label
 
-    ix = np.clip(
-        ((xy[:, 0] - x_min) / (x_max - x_min) * (grid_res - 1)).astype(int),
-        0, grid_res - 1
-    )
-    iy = np.clip(
-        ((xy[:, 1] - y_min) / (y_max - y_min) * (grid_res - 1)).astype(int),
-        0, grid_res - 1
-    )
+    ix = np.clip(((xy[:, 0] - x_min) / (x_max - x_min) * (grid_res - 1)).astype(int), 0, grid_res - 1)
+    iy = np.clip(((xy[:, 1] - y_min) / (y_max - y_min) * (grid_res - 1)).astype(int), 0, grid_res - 1)
 
-    object_mask = object_grid[iy, ix]
-    print(f"Object points: {object_mask.sum()} | Floor points: {(~object_mask).sum()}")
-
-    return object_mask
+    return object_grid[iy, ix]
 
 
 # ============================================================
@@ -105,98 +81,61 @@ def fit_plane(xyz):
 
 
 # ============================================================
-# MAIN PIPELINE (RUNS WHEN YOU CLICK ▶)
+# MAIN PIPELINE (TOPOLOGY SAFE)
 # ============================================================
 
 def main():
-    print("Loading:", INPUT_PLY)
-    pcd = o3d.io.read_point_cloud(INPUT_PLY)
-    pts = np.asarray(pcd.points)
+    print("Loading mesh:", INPUT_PLY)
+    mesh = o3d.io.read_triangle_mesh(INPUT_PLY)
 
-    if len(pts) == 0:
-        raise RuntimeError("PLY file contains no points")
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        raise RuntimeError("Input PLY must be a triangle mesh")
 
-    # Separate object vs floor
-    object_mask = detect_floor_boundary(pts, GRID_RES)
-    floor_pts = pts[~object_mask]
+    verts = np.asarray(mesh.vertices)
+    tris  = np.asarray(mesh.triangles)
 
-    if len(floor_pts) < 50:
-        raise RuntimeError("Too few floor points for plane fitting")
+    print(f"Vertices: {len(verts)} | Faces: {len(tris)}")
 
-    # Fit plane to floor
-    a, b, c = fit_plane(floor_pts)
+    # --------------------------------------------------------
+    # Detect floor vs object vertices
+    # --------------------------------------------------------
+    object_mask = detect_floor_boundary(verts, GRID_RES)
+    if object_mask.sum() < 50:
+        raise RuntimeError("Too few object vertices detected")
+
+    # --------------------------------------------------------
+    # Fit plane to floor vertices
+    # --------------------------------------------------------
+    a, b, c = fit_plane(verts[~object_mask])
     print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
-    # Plane subtraction
-    z_plane = a * pts[:, 0] + b * pts[:, 1] + (c-shift)
-    z_new = pts[:, 2] - z_plane
+    # --------------------------------------------------------
+    # Plane subtraction (vertex Z only)
+    # --------------------------------------------------------
+    z_plane = a * verts[:, 0] + b * verts[:, 1] + (c - shift)
+    verts[:, 2] = np.maximum(0.0, verts[:, 2] - z_plane)
 
-    # Clamp below-plane
-    z_new[z_new < 0] = 0.0
-    pts[:, 2] = z_new
+    # --------------------------------------------------------
+    # REMOVE FLOOR VIA FACE CULLING (CRITICAL STEP)
+    # --------------------------------------------------------
+    face_keep_mask = np.all(~object_mask[tris], axis=1)
+    mesh.triangles = o3d.utility.Vector3iVector(tris[face_keep_mask])
 
-    # --- REMOVE FLOOR POINTS HERE ---
-    pts = pts[~object_mask]
+    # --------------------------------------------------------
+    # Cleanup + normals
+    # --------------------------------------------------------
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.compute_vertex_normals()
 
-    # Write output
-    pcd.points = o3d.utility.Vector3dVector(pts)
-    o3d.io.write_point_cloud(OUTPUT_PLY, pcd)
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+    o3d.io.write_triangle_mesh(OUTPUT_PLY, mesh)
+    print("✅ Corrected mesh written with original topology preserved")
 
-    # Write output
-    pcd.points = o3d.utility.Vector3dVector(pts)
-    o3d.io.write_point_cloud(OUTPUT_PLY, pcd)
-
-
-
-
-    print("✅ Corrected PLY written to:", OUTPUT_PLY)
-
-    # # -----------------------------
-    # # 1. Estimate normals
-    # # -----------------------------
-    # pcd = o3d.io.read_point_cloud(OUTPUT_PLY)  # or your filtered cloud
-    # pcd.estimate_normals(
-    #     search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
-    # )
-    #
-    # # IMPORTANT: orient normals consistently
-    # pcd.orient_normals_consistent_tangent_plane(50)
-    #
-    # # -----------------------------
-    # # 2. Poisson reconstruction
-    # # -----------------------------
-    # mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-    #     pcd, depth=9
-    # )
-    #
-    # # -----------------------------
-    # # 3. Remove low-density artifacts
-    # # -----------------------------
-    # densities = np.asarray(densities)
-    # vertices_to_keep = densities > np.quantile(densities, 0.02)
-    #
-    # mesh = mesh.select_by_index(np.where(vertices_to_keep)[0])
-    #
-    # # Optional: crop to bounding box of original cloud
-    # bbox = pcd.get_axis_aligned_bounding_box()
-    # mesh = mesh.crop(bbox)
-    #
-    # # -----------------------------
-    # # 4. Clean up mesh
-    # # -----------------------------
-    # mesh.remove_degenerate_triangles()
-    # mesh.remove_duplicated_triangles()
-    # mesh.remove_duplicated_vertices()
-    # mesh.remove_non_manifold_edges()
-    # mesh.compute_vertex_normals()
-    #
-    # # Save
-    # o3d.io.write_triangle_mesh(OUTPUT_PLY2, mesh)
-    #
-    # print("✅ Watertight mesh saved")
-# ============================================================
-# IDE ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
