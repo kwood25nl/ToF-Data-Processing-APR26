@@ -5,6 +5,7 @@ from collections import Counter
 import numpy as np
 import open3d as o3d
 import trimesh
+import plotly.graph_objects as go
 
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, sobel, label
@@ -14,8 +15,7 @@ from scipy.ndimage import gaussian_filter, sobel, label
 # USER SETTINGS
 # ============================================================
 
-INPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
-
+INPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Depth Anything Outputs\239_Output\20260428_131402\Object_Mesh.ply"
 GRID_RES = 128
 SHIFT = 1000  # plane offset (legacy behavior preserved)
 
@@ -31,6 +31,7 @@ All outputs are written into:
     skewCorrection_YYYYMMDD_HHMMSS/
         CorrectedMesh.ply
         CorrectedMesh.stl
+        CorrectedMesh_3D.html
 """
 
 input_dir = os.path.dirname(os.path.abspath(INPUT_PLY))
@@ -39,8 +40,9 @@ timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR = os.path.join(input_dir, f"skewCorrection_{timestamp}")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-OUTPUT_PLY = os.path.join(OUTPUT_DIR, "CorrectedMesh.ply")
-OUTPUT_STL = os.path.join(OUTPUT_DIR, "CorrectedMesh.stl")
+OUTPUT_PLY  = os.path.join(OUTPUT_DIR, "CorrectedMesh.ply")
+OUTPUT_STL  = os.path.join(OUTPUT_DIR, "CorrectedMesh.stl")
+OUTPUT_HTML = os.path.join(OUTPUT_DIR, "CorrectedMesh_3D.html")
 
 
 # ============================================================
@@ -254,6 +256,80 @@ def cap_open_bottom(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 
 
 # ============================================================
+# 3D HTML VIEWER
+# ============================================================
+
+def save_mesh_3d_html(mesh: o3d.geometry.TriangleMesh, path: str):
+    """
+    Export an interactive, orbitable 3D mesh viewer as a self-contained HTML
+    file using Plotly's Mesh3d trace.
+
+    Vertices are coloured by Z height (Viridis colorscale) so surface
+    topology is immediately readable.  Lighting is set to give a sense of
+    depth without hiding fine detail.  Orbit, pan, and zoom all work with
+    the mouse out-of-the-box.
+    """
+    verts = np.asarray(mesh.vertices).copy()
+    faces = np.asarray(mesh.triangles).copy()
+
+    # Force Z floor to exactly 0.0 — cut_mesh_at_z can leave a small residual
+    verts[:, 2] -= verts[:, 2].min()
+
+    x, y, z = verts[:, 0], verts[:, 1], verts[:, 2]
+    i, j, k = faces[:, 0], faces[:, 1], faces[:, 2]
+
+    # Axis ranges for a balanced aspect ratio
+    x_range = (x.max() - x.min()) or 1.0
+    y_range = (y.max() - y.min()) or 1.0
+    z_range = (z.max() - z.min()) or 1.0
+    xy_max  = max(x_range, y_range)
+
+    fig = go.Figure(data=[go.Mesh3d(
+        x=x, y=y, z=z,
+        i=i, j=j, k=k,
+        intensity=z,                  # colour by height
+        colorscale="Viridis",
+        colorbar=dict(title="Z (mm)", thickness=15, len=0.6),
+        flatshading=False,
+        lighting=dict(
+            ambient=0.5,
+            diffuse=0.8,
+            specular=0.2,
+            roughness=0.5,
+            fresnel=0.1,
+        ),
+        lightposition=dict(x=1, y=1, z=2),
+        showscale=True,
+        name="Corrected Mesh",
+    )])
+
+    fig.update_layout(
+        title=dict(
+            text="Corrected Mesh – Interactive 3D Viewer (orbit / pan / zoom with mouse)",
+            font=dict(size=14),
+        ),
+        scene=dict(
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Z (mm)",
+            aspectmode="manual",
+            aspectratio=dict(
+                x=x_range / xy_max,
+                y=y_range / xy_max,
+                z=z_range / xy_max,
+            ),
+            camera=dict(
+                eye=dict(x=1.5, y=-1.5, z=1.2),   # sensible default orbit angle
+            ),
+        ),
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+
+    fig.write_html(path, include_plotlyjs="cdn", full_html=True)
+    print("Saved HTML:", path)
+
+
+# ============================================================
 # PIPELINE STAGES
 # ============================================================
 
@@ -317,6 +393,8 @@ def normalize_and_trim_bottom(mesh):
 
     boundary_vertices = np.unique(boundary_edges)
     max_z = vertices[boundary_vertices, 2].max()
+    min_z = np.asarray(mesh.vertices)[:, 2].min()
+    mesh.translate((0, 0, -min_z))
 
     return cut_mesh_at_z(mesh, max_z)
 
@@ -362,6 +440,8 @@ def main():
     save_corrected_ply(mesh, OUTPUT_PLY)
 
     cap_and_export_stl(OUTPUT_PLY, OUTPUT_STL)
+
+    save_mesh_3d_html(mesh, OUTPUT_HTML)
 
 
 if __name__ == "__main__":
