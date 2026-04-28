@@ -1,31 +1,59 @@
 import os
-import trimesh
+from datetime import datetime
+from collections import Counter
+
 import numpy as np
 import open3d as o3d
-from collections import Counter
+import trimesh
+
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, sobel, label
+
 
 # ============================================================
 # USER SETTINGS
 # ============================================================
 
-INPUT_PLY  = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
-OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.ply"
-OUTPUT_STL = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.stl"
-
+INPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
 
 GRID_RES = 128
-shift = 1000  # plane offset this value is translating the object upwar-this is clunky will need to fix
+SHIFT = 1000  # plane offset (legacy behavior preserved)
 
 
 # ============================================================
-# OBJECT / FLOOR DETECTION (UNCHANGED)
+# OUTPUT PATH HANDLING
 # ============================================================
 
-def detect_floor_boundary(pts, grid_res=150):
-    xy = pts[:, :2]
-    z  = pts[:, 2]
+"""
+All outputs are written into:
+
+<INPUT_FOLDER>/
+    skewCorrection_YYYYMMDD_HHMMSS/
+        CorrectedMesh.ply
+        CorrectedMesh.stl
+"""
+
+input_dir = os.path.dirname(os.path.abspath(INPUT_PLY))
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+OUTPUT_DIR = os.path.join(input_dir, f"skewCorrection_{timestamp}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+OUTPUT_PLY = os.path.join(OUTPUT_DIR, "CorrectedMesh.ply")
+OUTPUT_STL = os.path.join(OUTPUT_DIR, "CorrectedMesh.stl")
+
+
+# ============================================================
+# OBJECT / FLOOR DETECTION
+# ============================================================
+
+def detect_floor_boundary(points: np.ndarray, grid_res: int = 150) -> np.ndarray:
+    """
+    Separates object and floor vertices using gradient-based edge detection
+    on an interpolated Z surface.
+    """
+    xy = points[:, :2]
+    z = points[:, 2]
 
     x_min, y_min = xy.min(axis=0)
     x_max, y_max = xy.max(axis=0)
@@ -37,7 +65,7 @@ def detect_floor_boundary(pts, grid_res=150):
     grid_z = griddata(xy, z, (gxx, gyy), method="linear")
 
     if np.isnan(grid_z).all():
-        return np.ones(len(pts), dtype=bool)
+        return np.ones(len(points), dtype=bool)
 
     grid_z[np.isnan(grid_z)] = np.nanmean(grid_z)
 
@@ -59,13 +87,13 @@ def detect_floor_boundary(pts, grid_res=150):
         if len(region) < 10:
             continue
         centroid = region.mean(axis=0)
-        d = np.linalg.norm(centroid - center)
-        if d < best_dist:
-            best_dist = d
+        dist = np.linalg.norm(centroid - center)
+        if dist < best_dist:
+            best_dist = dist
             best_label = lbl
 
     if best_label is None:
-        return np.ones(len(pts), dtype=bool)
+        return np.ones(len(points), dtype=bool)
 
     object_grid = interior == best_label
 
@@ -74,16 +102,23 @@ def detect_floor_boundary(pts, grid_res=150):
 
     return object_grid[iy, ix]
 
-import numpy as np
-import open3d as o3d
 
-def cut_mesh_at_z(mesh, z_cut):
-    """
-    Cuts mesh with plane Z = z_cut
-    Deletes geometry below the plane
-    Leaves an open (uncapped) flat bottom
-    """
+# ============================================================
+# GEOMETRY UTILITIES
+# ============================================================
 
+def fit_plane(xyz: np.ndarray):
+    """Fits a plane of form z = ax + by + c."""
+    X = np.c_[xyz[:, 0], xyz[:, 1], np.ones(len(xyz))]
+    y = xyz[:, 2]
+    return np.linalg.lstsq(X, y, rcond=None)[0]
+
+
+def cut_mesh_at_z(mesh: o3d.geometry.TriangleMesh, z_cut: float):
+    """
+    Cuts mesh at Z = z_cut and removes geometry above that height.
+    Leaves an open (uncapped) flat bottom.
+    """
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
 
@@ -91,7 +126,6 @@ def cut_mesh_at_z(mesh, z_cut):
     new_triangles = []
 
     def intersect(v1, v2):
-        """Linear interpolation for z-plane intersection"""
         t = (z_cut - v1[2]) / (v2[2] - v1[2])
         return v1 + t * (v2 - v1)
 
@@ -100,11 +134,9 @@ def cut_mesh_at_z(mesh, z_cut):
         above = pts[:, 2] >= z_cut
 
         if np.all(above):
-            # Fully above plane → keep triangle
             new_triangles.append(tri.tolist())
 
         elif np.any(above):
-            # Triangle is intersected by plane
             kept = pts[above]
             cut = pts[~above]
 
@@ -114,10 +146,8 @@ def cut_mesh_at_z(mesh, z_cut):
                 v2 = intersect(v0, cut[1])
 
                 i0 = new_vertices.index(v0.tolist())
-                i1 = len(new_vertices)
-                new_vertices.append(v1.tolist())
-                i2 = len(new_vertices)
-                new_vertices.append(v2.tolist())
+                i1 = len(new_vertices); new_vertices.append(v1.tolist())
+                i2 = len(new_vertices); new_vertices.append(v2.tolist())
 
                 new_triangles.append([i0, i1, i2])
 
@@ -128,270 +158,210 @@ def cut_mesh_at_z(mesh, z_cut):
 
                 i0 = new_vertices.index(v0.tolist())
                 i1 = new_vertices.index(v1.tolist())
-                i2 = len(new_vertices)
-                new_vertices.append(v2.tolist())
-                i3 = len(new_vertices)
-                new_vertices.append(v3.tolist())
+                i2 = len(new_vertices); new_vertices.append(v2.tolist())
+                i3 = len(new_vertices); new_vertices.append(v3.tolist())
 
-                new_triangles.append([i0, i1, i2])
-                new_triangles.append([i1, i3, i2])
+                new_triangles.extend([
+                    [i0, i1, i2],
+                    [i1, i3, i2],
+                ])
 
-    clipped_mesh = o3d.geometry.TriangleMesh()
-    clipped_mesh.vertices = o3d.utility.Vector3dVector(np.array(new_vertices))
-    clipped_mesh.triangles = o3d.utility.Vector3iVector(np.array(new_triangles))
-    clipped_mesh.remove_duplicated_vertices()
-    clipped_mesh.remove_duplicated_triangles()
-    clipped_mesh.remove_degenerate_triangles()
-    clipped_mesh.compute_vertex_normals()
+    clipped = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(np.array(new_vertices)),
+        triangles=o3d.utility.Vector3iVector(np.array(new_triangles))
+    )
 
-    return clipped_mesh
+    clipped.remove_duplicated_vertices()
+    clipped.remove_duplicated_triangles()
+    clipped.remove_degenerate_triangles()
+    clipped.compute_vertex_normals()
 
-
-
-# ============================================================
-# PLANE FIT: z = ax + by + c
-# ============================================================
-
-def fit_plane(xyz):
-    X = np.c_[xyz[:, 0], xyz[:, 1], np.ones(len(xyz))]
-    y = xyz[:, 2]
-    return np.linalg.lstsq(X, y, rcond=None)[0]
+    return clipped
 
 
 def cap_open_bottom(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    # ── Diagnose boundary edges ──────────────────────────────────────────────
-    boundary_edges = mesh.edges[trimesh.grouping.group_rows(
-        mesh.edges_sorted, require_count=1)]
+    """
+    Caps the lowest open boundary loop to make the mesh watertight.
+    """
+    boundary_edges = mesh.edges[
+        trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)
+    ]
 
     if len(boundary_edges) == 0:
-        print("No boundary edges found at all — mesh topology may be non-manifold.")
         return mesh
 
-    boundary_z_values = []
-    for e in boundary_edges:
-        boundary_z_values.append(mesh.vertices[e[0]][2])
-        boundary_z_values.append(mesh.vertices[e[1]][2])
-
-    boundary_z_values = np.array(boundary_z_values)
-    print(f"Boundary edge z-values — min: {boundary_z_values.min():.6f}, "
-          f"max: {boundary_z_values.max():.6f}, "
-          f"mean: {boundary_z_values.mean():.6f}")
-
-    # ── Snap boundary vertices to their median z, use adaptive tolerance ─────
-    bottom_z = np.median(boundary_z_values)
-    Z_TOL = (boundary_z_values.max() - boundary_z_values.min()) * 0.1 + 1e-6
-    print(f"Using bottom_z={bottom_z:.6f}, Z_TOL={Z_TOL:.6f}")
+    boundary_z = np.array([mesh.vertices[v][2] for e in boundary_edges for v in e])
+    bottom_z = np.median(boundary_z)
+    z_tol = (boundary_z.max() - boundary_z.min()) * 0.1 + 1e-6
 
     bottom_edges = [
         e for e in boundary_edges
-        if abs(mesh.vertices[e[0]][2] - bottom_z) < Z_TOL
-           and abs(mesh.vertices[e[1]][2] - bottom_z) < Z_TOL
+        if abs(mesh.vertices[e[0]][2] - bottom_z) < z_tol
+        and abs(mesh.vertices[e[1]][2] - bottom_z) < z_tol
     ]
 
-    print(f"Bottom boundary edges found: {len(bottom_edges)}")
-
     if not bottom_edges:
-        print("Still no boundary edges found at computed bottom_z.")
         return mesh
 
-    # ── Snap those vertices exactly to bottom_z (avoids non-planar cap) ──────
     bottom_vert_ids = set(v for e in bottom_edges for v in e)
-    new_vertices = mesh.vertices.copy()
+    vertices = mesh.vertices.copy()
     for vid in bottom_vert_ids:
-        new_vertices[vid][2] = bottom_z
-    mesh = trimesh.Trimesh(vertices=new_vertices, faces=mesh.faces, process=False)
+        vertices[vid][2] = bottom_z
 
-    # ── Order boundary vertices into a loop ─────────────────────────────────
-    edge_map: dict[int, list[int]] = {}
+    mesh = trimesh.Trimesh(vertices, mesh.faces, process=False)
+
+    edge_map = {}
     for a, b in bottom_edges:
         edge_map.setdefault(a, []).append(b)
         edge_map.setdefault(b, []).append(a)
 
     start = next(iter(edge_map))
     loop = [start]
-    prev = None
-    current = start
+    prev, cur = None, start
+
     while True:
-        neighbors = edge_map[current]
-        nxt = next((n for n in neighbors if n != prev), None)
+        nxt = next((n for n in edge_map[cur] if n != prev), None)
         if nxt is None or nxt == start:
             break
         loop.append(nxt)
-        prev, current = current, nxt
-
-    print(f"Boundary loop length: {len(loop)} vertices")
+        prev, cur = cur, nxt
 
     if len(loop) < 3:
-        print("Boundary loop too small to cap.")
         return mesh
 
-    # ── Build cap triangles (fan from centroid) ──────────────────────────────
     loop_verts = mesh.vertices[loop]
     centroid = loop_verts.mean(axis=0)
     centroid[2] = bottom_z
 
-    n_orig = len(mesh.vertices)
-    new_verts = np.vstack([mesh.vertices, centroid])
+    new_vertices = np.vstack([mesh.vertices, centroid])
+    center_idx = len(mesh.vertices)
 
     cap_faces = []
-    n = len(loop)
-    for i in range(n):
-        a = loop[i]
-        b = loop[(i + 1) % n]
-        v0 = new_verts[a] - centroid
-        v1 = new_verts[b] - centroid
-        normal_z = np.cross(v0, v1)[2]
-        if normal_z > 0:
-            cap_faces.append([n_orig, a, b])
-        else:
-            cap_faces.append([n_orig, b, a])
+    for i in range(len(loop)):
+        a, b = loop[i], loop[(i + 1) % len(loop)]
+        normal = np.cross(new_vertices[a] - centroid, new_vertices[b] - centroid)[2]
+        cap_faces.append(
+            [center_idx, a, b] if normal > 0 else [center_idx, b, a]
+        )
 
-    cap_faces = np.array(cap_faces, dtype=np.int64)
-    all_faces = np.vstack([mesh.faces, cap_faces])
-
-    closed = trimesh.Trimesh(vertices=new_verts, faces=all_faces, process=False)
-    unique_faces = trimesh.grouping.unique_rows(closed.faces)[0]
     closed = trimesh.Trimesh(
-        vertices=closed.vertices,
-        faces=closed.faces[unique_faces],
-        process=True  # process=True handles degenerate faces + normals automatically
+        vertices=new_vertices,
+        faces=np.vstack([mesh.faces, cap_faces]),
+        process=True
     )
 
     return closed
 
+
 # ============================================================
-# MAIN PIPELINE (TOPOLOGY SAFE)
+# PIPELINE STAGES
 # ============================================================
 
-def main():
-    print("Loading mesh:", INPUT_PLY)
-    mesh = o3d.io.read_triangle_mesh(INPUT_PLY)
+def load_open3d_mesh(path: str) -> o3d.geometry.TriangleMesh:
+    print("Loading:", path)
+    mesh = o3d.io.read_triangle_mesh(path)
 
     if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
-        raise RuntimeError("Input PLY must be a triangle mesh")
+        raise RuntimeError("Input mesh is empty or invalid")
 
-    verts = np.asarray(mesh.vertices)
-    tris  = np.asarray(mesh.triangles)
+    print(f"Vertices: {len(mesh.vertices)} | Faces: {len(mesh.triangles)}")
+    return mesh
 
-    print(f"Vertices: {len(verts)} | Faces: {len(tris)}")
 
-    # --------------------------------------------------------
-    # Detect floor vs object vertices
-    # --------------------------------------------------------
-    object_mask = detect_floor_boundary(verts, GRID_RES)
+def separate_object_and_floor(mesh, grid_res):
+    object_mask = detect_floor_boundary(np.asarray(mesh.vertices), grid_res)
     if object_mask.sum() < 50:
         raise RuntimeError("Too few object vertices detected")
+    return object_mask
 
-    # --------------------------------------------------------
-    # Fit plane to floor vertices
-    # --------------------------------------------------------
-    a, b, c = fit_plane(verts[~object_mask])
+
+def subtract_floor_plane(mesh, object_mask, shift):
+    vertices = np.asarray(mesh.vertices)
+    a, b, c = fit_plane(vertices[~object_mask])
     print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
-    # --------------------------------------------------------
-    # Plane subtraction (vertex Z only)
-    # --------------------------------------------------------
-    z_plane = a * verts[:, 0] + b * verts[:, 1] + (c - shift)
-    verts[:, 2] = np.maximum(0.0, verts[:, 2] - z_plane)
+    z_plane = a * vertices[:, 0] + b * vertices[:, 1] + (c - shift)
+    vertices[:, 2] = np.maximum(0.0, vertices[:, 2] - z_plane)
 
-    # --------------------------------------------------------
-    # REMOVE FLOOR VIA FACE CULLING (CRITICAL STEP)
-    # --------------------------------------------------------
-    face_keep_mask = np.all(~object_mask[tris], axis=1)
-    mesh.triangles = o3d.utility.Vector3iVector(tris[face_keep_mask])
 
-    # --------------------------------------------------------
-    # Cleanup + normals
-    # --------------------------------------------------------
+def remove_floor_faces(mesh, object_mask):
+    triangles = np.asarray(mesh.triangles)
+    face_mask = np.all(~object_mask[triangles], axis=1)
+
+    mesh.triangles = o3d.utility.Vector3iVector(triangles[face_mask])
     mesh.remove_unreferenced_vertices()
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
     mesh.remove_non_manifold_edges()
     mesh.compute_vertex_normals()
 
-    # --------------------------------------------------------
-    # Flatten Bottom
-    # --------------------------------------------------------
 
+def normalize_and_trim_bottom(mesh):
     min_z = np.asarray(mesh.vertices)[:, 2].min()
     mesh.translate((0, 0, -min_z))
 
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
 
-    bbox = mesh.get_axis_aligned_bounding_box()
-    min_bound = bbox.min_bound
-    max_bound = bbox.max_bound
-
-    print("Bounding box min:", min_bound)
-    print("Bounding box max:", max_bound)
-    print("Extent:", max_bound - min_bound)
-
-    # Collect all edges from triangles
     edges = []
     for tri in triangles:
-        edges.append(tuple(sorted((tri[0], tri[1]))))
-        edges.append(tuple(sorted((tri[1], tri[2]))))
-        edges.append(tuple(sorted((tri[2], tri[0]))))
+        edges.extend([
+            tuple(sorted((tri[0], tri[1]))),
+            tuple(sorted((tri[1], tri[2]))),
+            tuple(sorted((tri[2], tri[0])))
+        ])
 
-    # Count how many times each edge occurs
-    edge_count = Counter(edges)
+    boundary_edges = [e for e, c in Counter(edges).items() if c == 1]
+    if not boundary_edges:
+        raise RuntimeError("No boundary edges found")
 
-    # Boundary edges occur exactly once
-    boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
+    boundary_vertices = np.unique(boundary_edges)
+    max_z = vertices[boundary_vertices, 2].max()
 
-    if len(boundary_edges) == 0:
-        raise ValueError("Mesh has no boundary edges (mesh may be closed).")
-
-    # Unique vertex indices on boundary
-    boundary_vertices = np.unique(np.array(boundary_edges))
-
-    # Extract Z values
-    z_values = vertices[boundary_vertices, 2]
-
-    # Max Z
-    max_z = z_values.max()
-
-    mesh = cut_mesh_at_z(mesh, max_z)
-
-    bbox = mesh.get_axis_aligned_bounding_box()
-    print("New min Z:", bbox.min_bound[2])  # should be ~z_cut
+    return cut_mesh_at_z(mesh, max_z)
 
 
+def save_corrected_ply(mesh, path):
+    o3d.io.write_triangle_mesh(path, mesh)
+    print("Saved PLY:", path)
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
 
-    o3d.io.write_triangle_mesh(OUTPUT_PLY, mesh)
-    print("✅ Corrected mesh written with original topology preserved")
-
-    o3d_mesh = o3d.io.read_triangle_mesh(OUTPUT_PLY)
+def cap_and_export_stl(ply_path, stl_path):
+    o3d_mesh = o3d.io.read_triangle_mesh(ply_path)
     o3d_mesh.compute_vertex_normals()
 
-    print(f"Vertices : {len(o3d_mesh.vertices)}")
-    print(f"Faces    : {len(o3d_mesh.triangles)}")
-    # Convert to trimesh for hole-capping logic
-    mesh = trimesh.Trimesh(
+    tm = trimesh.Trimesh(
         vertices=np.asarray(o3d_mesh.vertices),
         faces=np.asarray(o3d_mesh.triangles),
         process=False
     )
 
-    print(f"Watertight before capping: {mesh.is_watertight}")
-
-    closed = cap_open_bottom(mesh)  # now receives a trimesh.Trimesh
-
+    print(f"Watertight before capping: {tm.is_watertight}")
+    closed = cap_open_bottom(tm)
     print(f"Watertight after  capping: {closed.is_watertight}")
 
-    if not closed.is_watertight:
-        print("WARNING: mesh is still not watertight.")
+    closed.export(stl_path)
+    print("Saved STL:", stl_path)
 
-    # Export
-    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_STL)), exist_ok=True)
-    closed.export(OUTPUT_STL)
-    print(f"Saved STL: {OUTPUT_STL}")
 
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    mesh = load_open3d_mesh(INPUT_PLY)
+
+    object_mask = separate_object_and_floor(mesh, GRID_RES)
+
+    subtract_floor_plane(mesh, object_mask, SHIFT)
+
+    remove_floor_faces(mesh, object_mask)
+
+    mesh = normalize_and_trim_bottom(mesh)
+
+    save_corrected_ply(mesh, OUTPUT_PLY)
+
+    cap_and_export_stl(OUTPUT_PLY, OUTPUT_STL)
 
 
 if __name__ == "__main__":
