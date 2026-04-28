@@ -1,3 +1,5 @@
+import os
+import trimesh
 import numpy as np
 import open3d as o3d
 from collections import Counter
@@ -10,9 +12,11 @@ from scipy.ndimage import gaussian_filter, sobel, label
 
 INPUT_PLY  = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\Object_Mesh.ply"
 OUTPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.ply"
+OUTPUT_STL = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-000042\DA tests\Output\20260424_162733\CorrectedMeshV6.stl"
+
 
 GRID_RES = 128
-shift = 1000  # plane offset
+shift = 1000  # plane offset this value is translating the object upwar-this is clunky will need to fix
 
 
 # ============================================================
@@ -141,6 +145,9 @@ def cut_mesh_at_z(mesh, z_cut):
     clipped_mesh.compute_vertex_normals()
 
     return clipped_mesh
+
+
+
 # ============================================================
 # PLANE FIT: z = ax + by + c
 # ============================================================
@@ -150,6 +157,107 @@ def fit_plane(xyz):
     y = xyz[:, 2]
     return np.linalg.lstsq(X, y, rcond=None)[0]
 
+
+def cap_open_bottom(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    # ── Diagnose boundary edges ──────────────────────────────────────────────
+    boundary_edges = mesh.edges[trimesh.grouping.group_rows(
+        mesh.edges_sorted, require_count=1)]
+
+    if len(boundary_edges) == 0:
+        print("No boundary edges found at all — mesh topology may be non-manifold.")
+        return mesh
+
+    boundary_z_values = []
+    for e in boundary_edges:
+        boundary_z_values.append(mesh.vertices[e[0]][2])
+        boundary_z_values.append(mesh.vertices[e[1]][2])
+
+    boundary_z_values = np.array(boundary_z_values)
+    print(f"Boundary edge z-values — min: {boundary_z_values.min():.6f}, "
+          f"max: {boundary_z_values.max():.6f}, "
+          f"mean: {boundary_z_values.mean():.6f}")
+
+    # ── Snap boundary vertices to their median z, use adaptive tolerance ─────
+    bottom_z = np.median(boundary_z_values)
+    Z_TOL = (boundary_z_values.max() - boundary_z_values.min()) * 0.1 + 1e-6
+    print(f"Using bottom_z={bottom_z:.6f}, Z_TOL={Z_TOL:.6f}")
+
+    bottom_edges = [
+        e for e in boundary_edges
+        if abs(mesh.vertices[e[0]][2] - bottom_z) < Z_TOL
+           and abs(mesh.vertices[e[1]][2] - bottom_z) < Z_TOL
+    ]
+
+    print(f"Bottom boundary edges found: {len(bottom_edges)}")
+
+    if not bottom_edges:
+        print("Still no boundary edges found at computed bottom_z.")
+        return mesh
+
+    # ── Snap those vertices exactly to bottom_z (avoids non-planar cap) ──────
+    bottom_vert_ids = set(v for e in bottom_edges for v in e)
+    new_vertices = mesh.vertices.copy()
+    for vid in bottom_vert_ids:
+        new_vertices[vid][2] = bottom_z
+    mesh = trimesh.Trimesh(vertices=new_vertices, faces=mesh.faces, process=False)
+
+    # ── Order boundary vertices into a loop ─────────────────────────────────
+    edge_map: dict[int, list[int]] = {}
+    for a, b in bottom_edges:
+        edge_map.setdefault(a, []).append(b)
+        edge_map.setdefault(b, []).append(a)
+
+    start = next(iter(edge_map))
+    loop = [start]
+    prev = None
+    current = start
+    while True:
+        neighbors = edge_map[current]
+        nxt = next((n for n in neighbors if n != prev), None)
+        if nxt is None or nxt == start:
+            break
+        loop.append(nxt)
+        prev, current = current, nxt
+
+    print(f"Boundary loop length: {len(loop)} vertices")
+
+    if len(loop) < 3:
+        print("Boundary loop too small to cap.")
+        return mesh
+
+    # ── Build cap triangles (fan from centroid) ──────────────────────────────
+    loop_verts = mesh.vertices[loop]
+    centroid = loop_verts.mean(axis=0)
+    centroid[2] = bottom_z
+
+    n_orig = len(mesh.vertices)
+    new_verts = np.vstack([mesh.vertices, centroid])
+
+    cap_faces = []
+    n = len(loop)
+    for i in range(n):
+        a = loop[i]
+        b = loop[(i + 1) % n]
+        v0 = new_verts[a] - centroid
+        v1 = new_verts[b] - centroid
+        normal_z = np.cross(v0, v1)[2]
+        if normal_z > 0:
+            cap_faces.append([n_orig, a, b])
+        else:
+            cap_faces.append([n_orig, b, a])
+
+    cap_faces = np.array(cap_faces, dtype=np.int64)
+    all_faces = np.vstack([mesh.faces, cap_faces])
+
+    closed = trimesh.Trimesh(vertices=new_verts, faces=all_faces, process=False)
+    unique_faces = trimesh.grouping.unique_rows(closed.faces)[0]
+    closed = trimesh.Trimesh(
+        vertices=closed.vertices,
+        faces=closed.faces[unique_faces],
+        process=True  # process=True handles degenerate faces + normals automatically
+    )
+
+    return closed
 
 # ============================================================
 # MAIN PIPELINE (TOPOLOGY SAFE)
@@ -257,6 +365,33 @@ def main():
 
     o3d.io.write_triangle_mesh(OUTPUT_PLY, mesh)
     print("✅ Corrected mesh written with original topology preserved")
+
+    o3d_mesh = o3d.io.read_triangle_mesh(OUTPUT_PLY)
+    o3d_mesh.compute_vertex_normals()
+
+    print(f"Vertices : {len(o3d_mesh.vertices)}")
+    print(f"Faces    : {len(o3d_mesh.triangles)}")
+    # Convert to trimesh for hole-capping logic
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(o3d_mesh.vertices),
+        faces=np.asarray(o3d_mesh.triangles),
+        process=False
+    )
+
+    print(f"Watertight before capping: {mesh.is_watertight}")
+
+    closed = cap_open_bottom(mesh)  # now receives a trimesh.Trimesh
+
+    print(f"Watertight after  capping: {closed.is_watertight}")
+
+    if not closed.is_watertight:
+        print("WARNING: mesh is still not watertight.")
+
+    # Export
+    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_STL)), exist_ok=True)
+    closed.export(OUTPUT_STL)
+    print(f"Saved STL: {OUTPUT_STL}")
+
 
 
 if __name__ == "__main__":
