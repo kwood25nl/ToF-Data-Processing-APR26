@@ -380,7 +380,8 @@ class ToFSensorProcessor:
                     all_i.append(base + a)
                     all_j.append(base + b)
                     all_k.append(base + c)
-                    hover_text.append(f"Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
+                    zone = row * 8 + col
+                    hover_text.append(f"Zone: Z{zone}<br>Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
         
         # Create Plotly figure
         fig = go.Figure(data=[
@@ -432,8 +433,9 @@ class ToFSensorProcessor:
         # Add text annotations
         for i in range(8):
             for j in range(8):
-                text = ax.text(j, i, f'{heatmap[i, j]:.0f}',
-                             ha="center", va="center", color="white", fontsize=8)
+                zone = i * 8 + j
+                text = ax.text(j, i, f'Z{zone}\n{heatmap[i, j]:.0f}',
+                             ha="center", va="center", color="white", fontsize=7)
         
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label('Distance (mm)', fontsize=12)
@@ -463,11 +465,15 @@ class ToFSensorProcessor:
         colors = plt.cm.viridis(heights / heights.max())
         
         # Plot bars
+        label_offset = max(float(heights.max()) * 0.02, 0.2)
         for row in range(8):
             for col in range(8):
                 h = heights[row, col]
                 ax.bar3d(col, row, 0, 1, 1, h, color=colors[row, col], 
                         shade=True, edgecolor='black', linewidth=0.3)
+                zone = row * 8 + col
+                ax.text(col + 0.5, row + 0.5, h + label_offset, f'Z{zone}',
+                        ha='center', va='bottom', fontsize=6, color='black')
         
         ax.set_xlabel('Column')
         ax.set_ylabel('Row')
