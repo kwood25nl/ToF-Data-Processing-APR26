@@ -188,7 +188,7 @@ class ToFSensorProcessor:
         Returns:
             Tuple of (vertices, faces)
         """
-        # Build 8x8 height matrix
+        # Build 8x8 height matrix with row 0 at the bottom (Z0..Z7)
         heights = np.zeros((8, 8), dtype=np.float32)
         for z in range(64):
             row = z // 8
@@ -381,7 +381,7 @@ class ToFSensorProcessor:
                     all_j.append(base + b)
                     all_k.append(base + c)
                     zone = row * 8 + col
-                    hover_text.append(f"Zone: Z{zone}<br>Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
+                    hover_text.append(f"<b>Zone: Z{zone}</b><br>Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
         
         # Create Plotly figure
         fig = go.Figure(data=[
@@ -420,7 +420,7 @@ class ToFSensorProcessor:
         
         fig, ax = plt.subplots(figsize=(12, 12), dpi=100)
         
-        im = ax.imshow(heatmap, cmap='viridis', aspect='equal', origin='upper')
+        im = ax.imshow(heatmap, cmap='viridis', aspect='equal', origin='lower')
         ax.set_title(f'Distance Heatmap - Frame {frame_idx}', fontsize=14)
         ax.set_xlabel('Column', fontsize=12)
         ax.set_ylabel('Row', fontsize=12)
@@ -435,7 +435,7 @@ class ToFSensorProcessor:
             for j in range(8):
                 zone = i * 8 + j
                 text = ax.text(j, i, f'Z{zone}\n{heatmap[i, j]:.0f}',
-                             ha="center", va="center", color="white", fontsize=7)
+                             ha="center", va="center", color="white", fontsize=10, fontweight='bold')
         
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label('Distance (mm)', fontsize=12)
@@ -473,7 +473,7 @@ class ToFSensorProcessor:
                         shade=True, edgecolor='black', linewidth=0.3)
                 zone = row * 8 + col
                 ax.text(col + 0.5, row + 0.5, h + label_offset, f'Z{zone}',
-                        ha='center', va='bottom', fontsize=6, color='black')
+                        ha='center', va='bottom', fontsize=9, fontweight='bold', color='black')
         
         ax.set_xlabel('Column')
         ax.set_ylabel('Row')
@@ -498,7 +498,7 @@ class ToFSensorProcessor:
         
         fig, ax = plt.subplots(figsize=(12, 12), dpi=dpi)
         
-        im = ax.imshow(heatmap, cmap='viridis', aspect='equal', origin='upper')
+        im = ax.imshow(heatmap, cmap='viridis', aspect='equal', origin='lower')
         ax.set_title(f'Distance Heatmap - Frame {frame_idx}', fontsize=14)
         ax.set_xlabel('Column', fontsize=12)
         ax.set_ylabel('Row', fontsize=12)
@@ -581,6 +581,7 @@ class ToFSensorProcessor:
             
             all_x, all_y, all_z = [], [], []
             all_i, all_j, all_k = [], [], []
+            hover_text = []
             colors_intensity = []
             
             heights = np.zeros((8, 8), dtype=np.float32)
@@ -617,11 +618,14 @@ class ToFSensorProcessor:
                         all_i.append(base + a)
                         all_j.append(base + b)
                         all_k.append(base + c)
+                        zone = row * 8 + col
+                        hover_text.append(f"<b>Zone: Z{zone}</b><br>Col: {col}<br>Row: {row}<br>Height: {h:.2f} mm")
             
             frames_data.append({
                 'x': all_x, 'y': all_y, 'z': all_z,
                 'i': all_i, 'j': all_j, 'k': all_k,
                 'intensity': colors_intensity,
+                'text': hover_text[:len(all_i)],
                 'frame_idx': frame_idx
             })
         
@@ -637,6 +641,8 @@ class ToFSensorProcessor:
                 colorbar=dict(title='Height (mm)'),
                 showscale=True,
                 flatshading=True,
+                hovertemplate='%{text}<extra></extra>',
+                text=initial['text'],
             )]
         )
         
@@ -653,6 +659,8 @@ class ToFSensorProcessor:
                         colorscale='Viridis',
                         showscale=True,
                         flatshading=True,
+                        hovertemplate='%{text}<extra></extra>',
+                        text=data['text'],
                     )],
                     name=str(data['frame_idx'])
                 )
