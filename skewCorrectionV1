@@ -515,58 +515,76 @@ def main():
     print(f"Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
 
     # --------------- STEP 2: PLANE SELECTION ---------------
-    if not USE_AUTOMATIC_FLOOR_DETECTION:
-        print("\nManual mode: Pick 3 points for the floor plane (SHIFT+LEFT CLICK on vertex, close window when done).")
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = mesh.vertices
-        vis = o3d.visualization.VisualizerWithEditing()
-        vis.create_window(window_name='Pick 3 floor plane points')
-        render_option = vis.get_render_option()
-        render_option.background_color = np.asarray([1, 1, 1])
-        vis.add_geometry(pcd)
-        vis.run()
-        vis.destroy_window()
-        picked_indices = vis.get_picked_points()
-        print("Picked indices:", picked_indices)
 
-        if len(picked_indices) != 3:
-            print("ERROR: Pick exactly 3 points! Rerun and pick again.")
-            return
-        points = np.asarray(pcd.points)[picked_indices]
-        print("Picked coordinates for plane fit:\n", points)
+    apply_plane = True
 
-        a, b, c = fit_plane_3pts(points)
-        print(f"Floor plane (manual): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
-
-    else:
+    if USE_AUTOMATIC_FLOOR_DETECTION:
         print("Automatic floor detection...")
         object_mask = detect_floor_boundary(np.asarray(mesh.vertices), GRID_RES)
         verts = np.asarray(mesh.vertices)
         a, b, c = fit_plane(verts[~object_mask])
         print(f"Floor plane (auto): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
+    elif USE_MANUAL_PLANE:
+        print("\nManual mode: Pick 3 points for the floor plane (SHIFT+LEFT CLICK on vertex).")
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = mesh.vertices
+
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name='Pick 3 floor plane points')
+        render_option = vis.get_render_option()
+        render_option.background_color = np.asarray([1, 1, 1])
+
+        vis.add_geometry(pcd)
+        vis.run()
+        vis.destroy_window()
+
+        picked_indices = vis.get_picked_points()
+        print("Picked indices:", picked_indices)
+
+        if len(picked_indices) != 3:
+            raise RuntimeError("Pick exactly 3 points")
+
+        points = np.asarray(pcd.points)[picked_indices]
+        a, b, c = fit_plane_3pts(points)
+
+        print(f"Floor plane (manual): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
+
+    else:
+        print("⚠️ Plane subtraction DISABLED — using raw input mesh")
+        apply_plane = False
+
     # --------------- STEP 3: DESKEW/SUBTRACT PLANE ---------------
-    verts = np.asarray(mesh.vertices)
-    z_plane = a * verts[:, 0] + b * verts[:, 1] + (c - SHIFT)
-    verts[:, 2] = verts[:, 2] - z_plane
-    mesh.vertices = o3d.utility.Vector3dVector(verts)
 
-    # --------------- STEP 4: EXPORT INTERMEDIATE DESKEWED MESH ---------------
-    DESKEWED_PLY = os.path.join(OUTPUT_DIR, "Deskewed_for_manual_edit.ply")
-    o3d.io.write_triangle_mesh(DESKEWED_PLY, mesh)
-    print("\nSaved deskewed mesh for further (optional) crop/repair to:")
-    print(DESKEWED_PLY)
-    print("Edit this mesh (crop/fix/weld/add-walls etc) and supply path to edited mesh (.ply) below.\n"
-          "(Press Enter to skip editing & use deskewed mesh for output)")
+    if apply_plane:
+        verts = np.asarray(mesh.vertices)
+        z_plane = a * verts[:, 0] + b * verts[:, 1] + (c - SHIFT)
+        verts[:, 2] = verts[:, 2] - z_plane
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+    else:
+        print("Skipping plane subtraction.")
 
-    # --------------- STEP 5: USER LOADS MANUALLY EDITED MESH OR CONTINUES ---------------
-    edited_ply_path = input("Enter the path to your EDITED/CLEANED mesh (.ply), or press Enter to use deskewed: ").strip()
-    if edited_ply_path == "":
-        edited_ply_path = DESKEWED_PLY
-    assert os.path.isfile(edited_ply_path), f"File not found: {edited_ply_path}"
+    # --------------- STEP 4–5: OPTIONAL MANUAL EDIT STEP ---------------
 
+    if apply_plane:
+        DESKEWED_PLY = os.path.join(OUTPUT_DIR, "Deskewed_for_manual_edit.ply")
+        o3d.io.write_triangle_mesh(DESKEWED_PLY, mesh)
+
+        print("\nSaved deskewed mesh for optional editing:")
+        print(DESKEWED_PLY)
+
+        edited_ply_path = input("Enter edited mesh path or press Enter to continue: ").strip()
+        if edited_ply_path == "":
+            edited_ply_path = DESKEWED_PLY
+    else:
+        print("Skipping deskew export and manual edit step.")
+        edited_ply_path = INPUT_PLY
+
+    # ✅ ALWAYS reload mesh and define verts/tris
     mesh = o3d.io.read_triangle_mesh(edited_ply_path)
     assert len(mesh.vertices) > 0 and len(mesh.triangles) > 0, "Empty mesh"
+
     verts = np.asarray(mesh.vertices)
     tris = np.asarray(mesh.triangles)
 
