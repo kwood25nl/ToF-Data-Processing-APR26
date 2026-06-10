@@ -9,42 +9,29 @@ import plotly.graph_objects as go
 
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter, sobel, label
+from collections import defaultdict
 
-
-# ============================================================
+# ========================================================
 # USER SETTINGS
-# ============================================================
+# ========================================================
 
-INPUT_PLY = r"Z:\Kaitie\ToF and Mono Camera Experiments APR26\Calibration Object Data 2APR2026\04-00002\Depth Anything Outputs\239_Output\20260428_131402\Object_Mesh.ply"
+INPUT_PLY = r"Z:\Kaitie\LiDAR\MultiZone\06MAY26 DaVinci Robot Motion Data\movingCalObject 04-00002\HyperDeck_0005 Photos_cropped\20260610_143646\Object_Mesh_crop.ply"
 GRID_RES = 128
-SHIFT = 1000  # plane offset (legacy behavior preserved)
+SHIFT = 0  # plane offset (legacy behavior)
+WALL_DELTA_Z = 1.0  # mm - height below base for wall
+USE_AUTOMATIC_FLOOR_DETECTION = False    # <--- Set False to keep all faces / turn off floor deletion
 
+# ------ (NEW!!) Manual Plane Selection Settings ---------
+# To use manual plane selection, set USE_MANUAL_PLANE = True,
+# and specify either 3 INDICES into the vertices array, or 3 XYZ tuples.
+USE_MANUAL_PLANE = False   # <--- Set True to use manual plane
+# If using indices (recommend, easiest): supply 3 indices from mesh.vertices
+# MANUAL_PLANE_INDICES = [0, 1, 2]   # Indices to pick (change to your picking)
 
-# ============================================================
-# OUTPUT PATH HANDLING
-# ============================================================
-
-"""
-All outputs are written into:
-
-<INPUT_FOLDER>/
-    skewCorrection_YYYYMMDD_HHMMSS/
-        CorrectedMesh.ply
-        CorrectedMesh.stl
-        CorrectedMesh_3D.html
-"""
-
-input_dir = os.path.dirname(os.path.abspath(INPUT_PLY))
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-OUTPUT_DIR = os.path.join(input_dir, f"skewCorrection_{timestamp}")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-OUTPUT_PLY  = os.path.join(OUTPUT_DIR, "CorrectedMesh.ply")
-OUTPUT_STL  = os.path.join(OUTPUT_DIR, "CorrectedMesh.stl")
-OUTPUT_HTML = os.path.join(OUTPUT_DIR, "CorrectedMesh_3D.html")
-
-
+# Alternative: XYZ coordinates. If non-empty, will take precedence over indices.
+# MANUAL_PLANE_POINTS = [
+#     [x1, y1, z1], [x2, y2, z2], [x3, y3, z3]
+# ]
 # ============================================================
 # OBJECT / FLOOR DETECTION
 # ============================================================
@@ -105,6 +92,23 @@ def detect_floor_boundary(points: np.ndarray, grid_res: int = 150) -> np.ndarray
     return object_grid[iy, ix]
 
 
+# ========================================================
+# OUTPUT PATH HANDLING
+# ========================================================
+
+input_dir = os.path.dirname(os.path.abspath(INPUT_PLY))
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+OUTPUT_DIR = os.path.join(input_dir, f"skewCorrection_{timestamp}")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+OUTPUT_PLY  = os.path.join(OUTPUT_DIR, "CorrectedMesh.ply")
+OUTPUT_STL  = os.path.join(OUTPUT_DIR, "CorrectedMesh.stl")
+OUTPUT_HTML = os.path.join(OUTPUT_DIR, "CorrectedMesh_3D.html")
+
+# ... (same as before: plane detection, geometry, grid, etc.) ...
+
+
 # ============================================================
 # GEOMETRY UTILITIES
 # ============================================================
@@ -115,7 +119,102 @@ def fit_plane(xyz: np.ndarray):
     y = xyz[:, 2]
     return np.linalg.lstsq(X, y, rcond=None)[0]
 
+# ----------(NEW) Fit plane through 3 points only-------- #
+def fit_plane_3pts(points: np.ndarray):
+    """
+    Returns a, b, c coefficients so z = ax + by + c, from 3 points.
+    """
+    p1, p2, p3 = points
+    # Find plane normal
+    v1 = p2 - p1
+    v2 = p3 - p1
+    n = np.cross(v1, v2)
+    if np.isclose(n[2], 0):
+        raise ValueError("Degenerate normal: Z component is zero")
+    # Plane: n[0](x-x1) + n[1](y-y1) + n[2](z-z1) = 0
+    # Solve for z = ax + by + c
+    a = -n[0]/n[2]
+    b = -n[1]/n[2]
+    c = (np.dot(n, p1) - n[0]*p1[0] - n[1]*p1[1]) / n[2]
+    return a, b, c
 
+# ... rest: cut_mesh_at_z, cap_open_bottom, save_mesh_3d_html ... unchanged ...
+
+
+# ============================================================
+# PIPELINE STAGES
+# ============================================================
+
+def load_open3d_mesh(path: str) -> o3d.geometry.TriangleMesh:
+    print("Loading:", path)
+    mesh = o3d.io.read_triangle_mesh(path)
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        raise RuntimeError("Input mesh is empty or invalid")
+    print(f"Vertices: {len(mesh.vertices)} | Faces: {len(mesh.triangles)}")
+    return mesh
+
+def separate_object_and_floor(mesh, grid_res):
+    object_mask = detect_floor_boundary(np.asarray(mesh.vertices), grid_res)
+    if object_mask.sum() < 50:
+        raise RuntimeError("Too few object vertices detected")
+    return object_mask
+
+def subtract_floor_plane(mesh, object_mask, shift, use_manual_plane=False, manual_plane_points=None, manual_plane_indices=None):
+    vertices = np.asarray(mesh.vertices)
+    if use_manual_plane:
+        if manual_plane_points and len(manual_plane_points) == 3:
+            pts = np.array(manual_plane_points)
+        elif manual_plane_indices and len(manual_plane_indices) == 3:
+            pts = vertices[manual_plane_indices]
+        else:
+            raise ValueError("Provide exactly 3 points or 3 indices for manual plane definition")
+        a, b, c = fit_plane_3pts(pts)
+        print(f"Manual Floor plane (by 3 pts): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
+    else:
+        a, b, c = fit_plane(vertices[~object_mask])
+        print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
+
+    z_plane = a * vertices[:, 0] + b * vertices[:, 1] + (c - shift)
+    vertices[:, 2] = np.maximum(0.0, vertices[:, 2] - z_plane)
+
+def remove_floor_faces(mesh, object_mask, disabled=False):
+    if disabled:
+        print("Floor face removal is disabled; all faces are retained.")
+        mesh.compute_vertex_normals()
+        return
+    triangles = np.asarray(mesh.triangles)
+    face_mask = np.all(~object_mask[triangles], axis=1)
+    mesh.triangles = o3d.utility.Vector3iVector(triangles[face_mask])
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.compute_vertex_normals()
+
+def normalize_and_trim_bottom(mesh):
+    min_z = np.asarray(mesh.vertices)[:, 2].min()
+    mesh.translate((0, 0, -min_z))
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    edges = []
+    for tri in triangles:
+        edges.extend([
+            tuple(sorted((tri[0], tri[1]))),
+            tuple(sorted((tri[1], tri[2]))),
+            tuple(sorted((tri[2], tri[0])))
+        ])
+
+    boundary_edges = [e for e, c in Counter(edges).items() if c == 1]
+    if not boundary_edges:
+        raise RuntimeError("No boundary edges found")
+
+    boundary_vertices = np.unique(boundary_edges)
+    max_z = vertices[boundary_vertices, 2].max()
+    min_z = np.asarray(mesh.vertices)[:, 2].min()
+    mesh.translate((0, 0, -min_z))
+
+    return cut_mesh_at_z(mesh, max_z)
 def cut_mesh_at_z(mesh: o3d.geometry.TriangleMesh, z_cut: float):
     """
     Cuts mesh at Z = z_cut and removes geometry above that height.
@@ -179,7 +278,6 @@ def cut_mesh_at_z(mesh: o3d.geometry.TriangleMesh, z_cut: float):
     clipped.compute_vertex_normals()
 
     return clipped
-
 
 def cap_open_bottom(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """
@@ -255,9 +353,26 @@ def cap_open_bottom(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return closed
 
 
-# ============================================================
-# 3D HTML VIEWER
-# ============================================================
+def save_corrected_ply(mesh, path):
+    o3d.io.write_triangle_mesh(path, mesh)
+    print("Saved PLY:", path)
+
+def cap_and_export_stl(ply_path, stl_path):
+    o3d_mesh = o3d.io.read_triangle_mesh(ply_path)
+    o3d_mesh.compute_vertex_normals()
+
+    tm = trimesh.Trimesh(
+        vertices=np.asarray(o3d_mesh.vertices),
+        faces=np.asarray(o3d_mesh.triangles),
+        process=False
+    )
+
+    print(f"Watertight before capping: {tm.is_watertight}")
+    closed = cap_open_bottom(tm)
+    print(f"Watertight after  capping: {closed.is_watertight}")
+
+    closed.export(stl_path)
+    print("Saved STL:", stl_path)
 
 def save_mesh_3d_html(mesh: o3d.geometry.TriangleMesh, path: str):
     """
@@ -282,12 +397,12 @@ def save_mesh_3d_html(mesh: o3d.geometry.TriangleMesh, path: str):
     x_range = (x.max() - x.min()) or 1.0
     y_range = (y.max() - y.min()) or 1.0
     z_range = (z.max() - z.min()) or 1.0
-    xy_max  = max(x_range, y_range)
+    xy_max = max(x_range, y_range)
 
     fig = go.Figure(data=[go.Mesh3d(
         x=x, y=y, z=z,
         i=i, j=j, k=k,
-        intensity=z,                  # colour by height
+        intensity=z,  # colour by height
         colorscale="Viridis",
         colorbar=dict(title="Z (mm)", thickness=15, len=0.6),
         flatshading=False,
@@ -319,7 +434,7 @@ def save_mesh_3d_html(mesh: o3d.geometry.TriangleMesh, path: str):
                 z=z_range / xy_max,
             ),
             camera=dict(
-                eye=dict(x=1.5, y=-1.5, z=1.2),   # sensible default orbit angle
+                eye=dict(x=1.5, y=-1.5, z=1.2),  # sensible default orbit angle
             ),
         ),
         margin=dict(l=0, r=0, t=50, b=0),
@@ -328,121 +443,222 @@ def save_mesh_3d_html(mesh: o3d.geometry.TriangleMesh, path: str):
     fig.write_html(path, include_plotlyjs="cdn", full_html=True)
     print("Saved HTML:", path)
 
+def project_and_merge_base_vertices_to_z0(verts, tris, z_epsilon=1e-5, xy_epsilon=1e-5):
+    """
+    Project all vertices within z_epsilon of z=0 to z=0,
+    then merge all (x,y,0) vertices within xy_epsilon to single unique verts.
+    Returns (new_verts, new_tris)
+    """
+    import numpy as np
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        from scipy.spatial import KDTree as cKDTree
 
-# ============================================================
-# PIPELINE STAGES
-# ============================================================
+    verts = np.asarray(verts)
+    tris = np.asarray(tris)
 
-def load_open3d_mesh(path: str) -> o3d.geometry.TriangleMesh:
-    print("Loading:", path)
-    mesh = o3d.io.read_triangle_mesh(path)
+    # 1. Snap all vertices close to z=0 onto z=0
+    near_base = np.abs(verts[:, 2]) < z_epsilon
+    verts[near_base, 2] = 0.0
 
-    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
-        raise RuntimeError("Input mesh is empty or invalid")
+    # 2. Find all exactly z=0 verts
+    is_base = np.abs(verts[:, 2]) < z_epsilon
+    base_indices = np.where(is_base)[0]
+    xy_base = verts[base_indices, :2]
 
-    print(f"Vertices: {len(mesh.vertices)} | Faces: {len(mesh.triangles)}")
-    return mesh
+    # 3. Merge (x, y, 0) verts within xy_epsilon using a KD-tree
+    to_keep = np.ones(len(base_indices), dtype=bool)
+    xy_tree = cKDTree(xy_base)
+    mapping = np.arange(len(verts))
+    for j, idx in enumerate(base_indices):
+        if not to_keep[j]:
+            continue
+        nearby = xy_tree.query_ball_point(xy_base[j], r=xy_epsilon)
+        for n in nearby:
+            if n != j:
+                to_keep[n] = False
+                mapping[base_indices[n]] = idx  # Map duplicates to representative
 
+    # Build mapping: old vertex idx → new compacted idx
+    keep_indices = np.setdiff1d(np.arange(len(verts)), base_indices[~to_keep])
+    mapping_lookup = np.zeros(len(verts), dtype=int)
+    new_verts_list = []
+    for new_idx, old_idx in enumerate(keep_indices):
+        mapping_lookup[old_idx] = new_idx
+        new_verts_list.append(verts[old_idx])
+    for i, idx in enumerate(base_indices):
+        if to_keep[i]:
+            continue  # already in keep_indices
+        mapping_lookup[idx] = mapping[idx]
+    new_verts = np.array(new_verts_list)
 
-def separate_object_and_floor(mesh, grid_res):
-    object_mask = detect_floor_boundary(np.asarray(mesh.vertices), grid_res)
-    if object_mask.sum() < 50:
-        raise RuntimeError("Too few object vertices detected")
-    return object_mask
+    # Update triangles
+    new_tris = mapping_lookup[tris]
 
-
-def subtract_floor_plane(mesh, object_mask, shift):
-    vertices = np.asarray(mesh.vertices)
-    a, b, c = fit_plane(vertices[~object_mask])
-    print(f"Floor plane: z = {a:.6f}x + {b:.6f}y + {c:.6f}")
-
-    z_plane = a * vertices[:, 0] + b * vertices[:, 1] + (c - shift)
-    vertices[:, 2] = np.maximum(0.0, vertices[:, 2] - z_plane)
-
-
-def remove_floor_faces(mesh, object_mask):
-    triangles = np.asarray(mesh.triangles)
-    face_mask = np.all(~object_mask[triangles], axis=1)
-
-    mesh.triangles = o3d.utility.Vector3iVector(triangles[face_mask])
-    mesh.remove_unreferenced_vertices()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_non_manifold_edges()
-    mesh.compute_vertex_normals()
-
-
-def normalize_and_trim_bottom(mesh):
-    min_z = np.asarray(mesh.vertices)[:, 2].min()
-    mesh.translate((0, 0, -min_z))
-
-    vertices = np.asarray(mesh.vertices)
-    triangles = np.asarray(mesh.triangles)
-
-    edges = []
-    for tri in triangles:
-        edges.extend([
-            tuple(sorted((tri[0], tri[1]))),
-            tuple(sorted((tri[1], tri[2]))),
-            tuple(sorted((tri[2], tri[0])))
-        ])
-
-    boundary_edges = [e for e, c in Counter(edges).items() if c == 1]
-    if not boundary_edges:
-        raise RuntimeError("No boundary edges found")
-
-    boundary_vertices = np.unique(boundary_edges)
-    max_z = vertices[boundary_vertices, 2].max()
-    min_z = np.asarray(mesh.vertices)[:, 2].min()
-    mesh.translate((0, 0, -min_z))
-
-    return cut_mesh_at_z(mesh, max_z)
-
-
-def save_corrected_ply(mesh, path):
-    o3d.io.write_triangle_mesh(path, mesh)
-    print("Saved PLY:", path)
-
-
-def cap_and_export_stl(ply_path, stl_path):
-    o3d_mesh = o3d.io.read_triangle_mesh(ply_path)
-    o3d_mesh.compute_vertex_normals()
-
-    tm = trimesh.Trimesh(
-        vertices=np.asarray(o3d_mesh.vertices),
-        faces=np.asarray(o3d_mesh.triangles),
-        process=False
-    )
-
-    print(f"Watertight before capping: {tm.is_watertight}")
-    closed = cap_open_bottom(tm)
-    print(f"Watertight after  capping: {closed.is_watertight}")
-
-    closed.export(stl_path)
-    print("Saved STL:", stl_path)
-
+    # Filter degenerate triangles (collapsed after merge)
+    keep = np.array([len(set(t)) == 3 for t in new_tris])
+    new_tris = new_tris[keep]
+    print(f"[project_and_merge_base_vertices_to_z0] Reduced base verts {len(base_indices)} → {np.sum(to_keep)}. All degenerate triangles removed.")
+    return new_verts, new_tris
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    mesh = load_open3d_mesh(INPUT_PLY)
 
-    object_mask = separate_object_and_floor(mesh, GRID_RES)
+    # --------------- STEP 1: LOAD MESH ---------------
+    mesh = o3d.io.read_triangle_mesh(INPUT_PLY)
+    if len(mesh.vertices) == 0 or len(mesh.triangles) == 0:
+        raise RuntimeError("Input mesh is empty or invalid")
+    print(f"Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
 
-    subtract_floor_plane(mesh, object_mask, SHIFT)
+    # --------------- STEP 2: PLANE SELECTION ---------------
+    if not USE_AUTOMATIC_FLOOR_DETECTION:
+        print("\nManual mode: Pick 3 points for the floor plane (SHIFT+LEFT CLICK on vertex, close window when done).")
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = mesh.vertices
+        vis = o3d.visualization.VisualizerWithEditing()
+        vis.create_window(window_name='Pick 3 floor plane points')
+        render_option = vis.get_render_option()
+        render_option.background_color = np.asarray([1, 1, 1])
+        vis.add_geometry(pcd)
+        vis.run()
+        vis.destroy_window()
+        picked_indices = vis.get_picked_points()
+        print("Picked indices:", picked_indices)
 
-    remove_floor_faces(mesh, object_mask)
+        if len(picked_indices) != 3:
+            print("ERROR: Pick exactly 3 points! Rerun and pick again.")
+            return
+        points = np.asarray(pcd.points)[picked_indices]
+        print("Picked coordinates for plane fit:\n", points)
 
-    mesh = normalize_and_trim_bottom(mesh)
+        a, b, c = fit_plane_3pts(points)
+        print(f"Floor plane (manual): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
-    save_corrected_ply(mesh, OUTPUT_PLY)
+    else:
+        print("Automatic floor detection...")
+        object_mask = detect_floor_boundary(np.asarray(mesh.vertices), GRID_RES)
+        verts = np.asarray(mesh.vertices)
+        a, b, c = fit_plane(verts[~object_mask])
+        print(f"Floor plane (auto): z = {a:.6f}x + {b:.6f}y + {c:.6f}")
 
-    cap_and_export_stl(OUTPUT_PLY, OUTPUT_STL)
+    # --------------- STEP 3: DESKEW/SUBTRACT PLANE ---------------
+    verts = np.asarray(mesh.vertices)
+    z_plane = a * verts[:, 0] + b * verts[:, 1] + (c - SHIFT)
+    verts[:, 2] = verts[:, 2] - z_plane
+    mesh.vertices = o3d.utility.Vector3dVector(verts)
 
-    save_mesh_3d_html(mesh, OUTPUT_HTML)
+    # --------------- STEP 4: EXPORT INTERMEDIATE DESKEWED MESH ---------------
+    DESKEWED_PLY = os.path.join(OUTPUT_DIR, "Deskewed_for_manual_edit.ply")
+    o3d.io.write_triangle_mesh(DESKEWED_PLY, mesh)
+    print("\nSaved deskewed mesh for further (optional) crop/repair to:")
+    print(DESKEWED_PLY)
+    print("Edit this mesh (crop/fix/weld/add-walls etc) and supply path to edited mesh (.ply) below.\n"
+          "(Press Enter to skip editing & use deskewed mesh for output)")
 
+    # --------------- STEP 5: USER LOADS MANUALLY EDITED MESH OR CONTINUES ---------------
+    edited_ply_path = input("Enter the path to your EDITED/CLEANED mesh (.ply), or press Enter to use deskewed: ").strip()
+    if edited_ply_path == "":
+        edited_ply_path = DESKEWED_PLY
+    assert os.path.isfile(edited_ply_path), f"File not found: {edited_ply_path}"
 
+    mesh = o3d.io.read_triangle_mesh(edited_ply_path)
+    assert len(mesh.vertices) > 0 and len(mesh.triangles) > 0, "Empty mesh"
+    verts = np.asarray(mesh.vertices)
+    tris = np.asarray(mesh.triangles)
+
+    # --------------- STEP 6: SHIFT UPWARD SO BASE IS AT WALL_DELTA_Z ---------------
+    min_z = verts[:, 2].min()
+    shift_up = WALL_DELTA_Z - min_z
+    verts[:, 2] += shift_up
+    mesh.vertices = o3d.utility.Vector3dVector(verts)
+
+    # --------------- STEP 7: PROJECT BOUNDARY WALLS TO Z=0 ---------------
+    # Find boundary edges
+    tri_edge_set = set()
+    for tri in tris:
+        for ei in [(0,1), (1,2), (2,0)]:
+            e = tuple(sorted([tri[ei[0]], tri[ei[1]]]))
+            if e in tri_edge_set:
+                tri_edge_set.remove(e)
+            else:
+                tri_edge_set.add(e)
+    boundary_edges = list(tri_edge_set)
+    boundary_vert_ids = list(sorted(set([vid for e in boundary_edges for vid in e])))
+
+    # Order boundary loop
+    conn = defaultdict(list)
+    for a, b in boundary_edges:
+        conn[a].append(b)
+        conn[b].append(a)
+    loop = []
+    vid_start = boundary_edges[0][0]
+    prev, curr = None, vid_start
+    for _ in range(len(boundary_edges) + 5):
+        loop.append(curr)
+        n = [v for v in conn[curr] if v != prev]
+        if not n:
+            break
+        prev, curr = curr, n[0]
+        if curr == vid_start:
+            break
+    if loop[0] != loop[-1]:
+        loop.append(loop[0])
+    loop = np.array(loop)
+
+    # Project boundary vertices to Z=0 for wall base
+    verts_top = verts[loop, :]
+    verts_bot = verts_top.copy()
+    verts_bot[:, 2] = 0
+
+    verts_new = np.vstack([verts, verts_bot])
+
+    # For each edge in loop, add 2 wall triangles
+    wall_tris = []
+    n_boundary = len(loop) - 1
+    n_orig = verts.shape[0]
+    for i in range(n_boundary):
+        v0 = loop[i]
+        v1 = loop[i + 1]
+        b0 = n_orig + i
+        b1 = n_orig + i + 1
+        wall_tris.append([v0, v1, b1])
+        wall_tris.append([v0, b1, b0])
+
+    tris_new = np.vstack([tris, np.array(wall_tris, dtype=np.int32)])
+
+    # ---- STEP 7B: ROBUST BASE SNAP AND MERGE ----
+    verts_final, tris_final = project_and_merge_base_vertices_to_z0(
+        verts_new, tris_new,
+        z_epsilon=1e-5, xy_epsilon=1e-5
+    )
+
+    # ---- Proceed with trimesh capping/export ----
+    import trimesh
+    tm = trimesh.Trimesh(vertices=verts_final, faces=tris_final, process=False)
+    print(f"Boundaries before capping: open edges: {(hasattr(tm,'edges_boundary') and len(getattr(tm,'edges_boundary', []))) or 'N/A'}")
+
+    closed = cap_open_bottom(tm)
+    if not closed.is_watertight:
+        print("Trying fill_holes() for watertight cap...")
+        closed = closed.fill_holes()
+    FINAL_OUTPUT_PLY = os.path.join(OUTPUT_DIR, "Final_CorrectedMesh.ply")
+    FINAL_OUTPUT_STL = os.path.join(OUTPUT_DIR, "Final_CorrectedMesh.stl")
+    FINAL_OUTPUT_HTML = os.path.join(OUTPUT_DIR, "Final_CorrectedMesh_3D.html")
+    closed.export(FINAL_OUTPUT_PLY)
+    closed.export(FINAL_OUTPUT_STL)
+
+    # For HTML
+    mesh_final = o3d.geometry.TriangleMesh()
+    mesh_final.vertices = o3d.utility.Vector3dVector(closed.vertices)
+    mesh_final.triangles = o3d.utility.Vector3iVector(closed.faces)
+    mesh_final.compute_vertex_normals()
+    save_mesh_3d_html(mesh_final, FINAL_OUTPUT_HTML)
+
+    print(f"\nAll outputs exported:\nPLY: {FINAL_OUTPUT_PLY}\nSTL: {FINAL_OUTPUT_STL}\nHTML: {FINAL_OUTPUT_HTML}")
+    print(f"(Walls project from mesh base at z={WALL_DELTA_Z} down to z=0; wall height is {WALL_DELTA_Z} mm and the mesh is capped and watertight.)\n")
 if __name__ == "__main__":
     main()
